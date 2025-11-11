@@ -10,9 +10,29 @@ from enum import Enum
 import random
 from collections import defaultdict
 from scipy.interpolate import RectBivariateSpline
+from scipy.optimize import differential_evolution, dual_annealing
 from functools import lru_cache
 import heapq
 from copy import deepcopy
+import warnings
+warnings.filterwarnings('ignore')
+
+# RL imports (with error handling)
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    from stable_baselines3 import PPO, A2C, SAC
+    from stable_baselines3.common.env_util import make_vec_env
+    from stable_baselines3.common.callbacks import BaseCallback
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+    # Create dummy classes for when RL is not available
+    class DummyEnv:
+        pass
+    gym = type('gym', (), {'Env': DummyEnv})()
+    spaces = type('spaces', (), {'Discrete': lambda x: None, 'Box': lambda **kwargs: None})()
+    # print("Info: Stable-Baselines3 not available. RL optimizer will use fallback SA.")
 
 class SegmentType(Enum):
     """Types of path segments in grid navigation"""
@@ -557,6 +577,7 @@ class EnergyAwareOptimizer:
                                 max_iterations: int = 500) -> Tuple[List[Waypoint], dict]:
         """
         Multi-objective optimization balancing energy and time.
+        FIXED: Baseline metrics are now calculated once to avoid segmentation fault.
 
         Parameters:
         -----------
@@ -576,6 +597,17 @@ class EnergyAwareOptimizer:
         energy_weight /= total_weight
         time_weight /= total_weight
 
+        # FIX: Calculate baseline metrics ONCE before the loop (not 500 times!)
+        baseline_seq = planner.sequence_waypoints(
+            waypoints, start_pos, mode='nearest_neighbor'
+        )
+        _, baseline_metrics = planner.plan_complete_tour(
+            baseline_seq, start_pos, sequencing_mode='custom',
+            custom_sequence=baseline_seq
+        )
+        baseline_energy = baseline_metrics['total_energy_j']
+        baseline_time = baseline_metrics['total_time']
+
         # Find sequences optimized for each objective
         energy_optimal = EnergyAwareOptimizer.simulated_annealing_tsp(
             waypoints, start_pos, planner, objective='energy',
@@ -587,24 +619,16 @@ class EnergyAwareOptimizer:
             max_iterations=max_iterations
         )
 
-        # Weighted objective function
+        # Weighted objective function (now uses cached baseline)
         def weighted_cost(sequence):
             segments, metrics = planner.plan_complete_tour(
                 sequence, start_pos, sequencing_mode='custom',
                 custom_sequence=sequence
             )
 
-            # Normalize by baseline (nearest neighbor)
-            baseline_seq = planner.sequence_waypoints(
-                waypoints, start_pos, mode='nearest_neighbor'
-            )
-            _, baseline_metrics = planner.plan_complete_tour(
-                baseline_seq, start_pos, sequencing_mode='custom',
-                custom_sequence=baseline_seq
-            )
-
-            norm_energy = metrics['total_energy_j'] / baseline_metrics['total_energy_j']
-            norm_time = metrics['total_time'] / baseline_metrics['total_time']
+            # Use pre-calculated baseline metrics
+            norm_energy = metrics['total_energy_j'] / baseline_energy
+            norm_time = metrics['total_time'] / baseline_time
 
             return energy_weight * norm_energy + time_weight * norm_time
 
@@ -646,6 +670,240 @@ class EnergyAwareOptimizer:
 
         return best_sequence, pareto_solutions
 
+    @staticmethod
+    def scipy_optimize_tsp(waypoints: List[Waypoint],
+                          start_pos: Tuple[float, float],
+                          planner: 'GridConstrainedPlanner',
+                          objective: str = 'energy',
+                          method: str = 'dual_annealing') -> List[Waypoint]:
+        """
+        Use SciPy's global optimization algorithms for TSP.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints to sequence
+        start_pos: Starting position
+        planner: Planner instance
+        objective: 'energy', 'distance', or 'time'
+        method: 'dual_annealing' or 'differential_evolution'
+
+        Returns:
+        --------
+        Optimized waypoint sequence
+        """
+        if not waypoints:
+            return []
+
+        n = len(waypoints)
+
+        # Objective function that takes a permutation vector
+        def cost_function(x):
+            # Convert continuous variables to permutation
+            indices = np.argsort(x)
+            sequence = [waypoints[i] for i in indices]
+
+            # Calculate cost
+            segments, metrics = planner.plan_complete_tour(
+                sequence, start_pos, sequencing_mode='custom',
+                custom_sequence=sequence
+            )
+
+            if objective == 'energy':
+                return metrics['total_energy_j']
+            elif objective == 'distance':
+                return metrics['total_distance']
+            elif objective == 'time':
+                return metrics['total_time']
+            else:
+                return metrics['total_energy_j']
+
+        # Bounds for each variable (used to generate permutations)
+        bounds = [(0, n) for _ in range(n)]
+
+        if method == 'dual_annealing':
+            result = dual_annealing(cost_function, bounds, maxiter=100, seed=42)
+        else:  # differential_evolution
+            result = differential_evolution(cost_function, bounds, maxiter=50, seed=42, workers=1)
+
+        # Convert result back to sequence
+        indices = np.argsort(result.x)
+        optimized_sequence = [waypoints[i] for i in indices]
+
+        return optimized_sequence
+
+
+class WaypointSequencingEnv(gym.Env):
+    """
+    Gymnasium environment for waypoint sequencing optimization using RL.
+    Compatible with Stable-Baselines3.
+    """
+
+    def __init__(self, waypoints: List[Waypoint], start_pos: Tuple[float, float],
+                 planner: 'GridConstrainedPlanner', objective: str = 'energy'):
+        super().__init__()
+
+        self.waypoints = waypoints
+        self.start_pos = start_pos
+        self.planner = planner
+        self.objective = objective
+        self.n_waypoints = len(waypoints)
+
+        # Action space: select next waypoint (discrete)
+        self.action_space = spaces.Discrete(self.n_waypoints)
+
+        # Observation space: current position + unvisited waypoints mask + elevation info
+        # [current_x, current_y, current_z] + [mask for each waypoint] + [waypoint features]
+        obs_dim = 3 + self.n_waypoints + (self.n_waypoints * 3)  # position + mask + waypoint coords
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+
+        # Episode state
+        self.current_pos = None
+        self.visited = None
+        self.sequence = None
+        self.total_cost = 0.0
+        self.steps = 0
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.current_pos = self.start_pos
+        self.visited = np.zeros(self.n_waypoints, dtype=bool)
+        self.sequence = []
+        self.total_cost = 0.0
+        self.steps = 0
+
+        obs = self._get_observation()
+        return obs, {}
+
+    def _get_observation(self):
+        """Build observation vector"""
+        # Current position
+        current_z = self.planner.elevation.get_elevation(self.current_pos[0], self.current_pos[1])
+        pos_features = [self.current_pos[0], self.current_pos[1], current_z]
+
+        # Visited mask
+        mask = (~self.visited).astype(np.float32)
+
+        # Waypoint features (x, y, z for each waypoint)
+        wp_features = []
+        for wp in self.waypoints:
+            wp_features.extend([wp.x, wp.y, wp.z])
+
+        obs = np.concatenate([pos_features, mask, wp_features], dtype=np.float32)
+        return obs
+
+    def step(self, action):
+        """Execute action (select next waypoint)"""
+        # Check if action is valid (not already visited)
+        if self.visited[action]:
+            # Invalid action - penalize heavily
+            reward = -1000.0
+            terminated = True
+            obs = self._get_observation()
+            return obs, reward, terminated, False, {}
+
+        # Mark as visited
+        self.visited[action] = True
+        selected_wp = self.waypoints[action]
+        self.sequence.append(selected_wp)
+
+        # Calculate cost of reaching this waypoint
+        segments = self.planner.plan_grid_route(self.current_pos, (selected_wp.x, selected_wp.y))
+        metrics = self.planner.calculate_metrics(segments)
+
+        if self.objective == 'energy':
+            step_cost = metrics['total_energy_j']
+        elif self.objective == 'distance':
+            step_cost = metrics['total_distance']
+        else:  # time
+            step_cost = metrics['total_time']
+
+        self.total_cost += step_cost
+        self.current_pos = (selected_wp.x, selected_wp.y)
+        self.steps += 1
+
+        # Reward is negative cost (we want to minimize)
+        reward = -step_cost / 1000.0  # Normalize
+
+        # Check if done
+        terminated = np.all(self.visited)
+
+        # Bonus for completing tour efficiently
+        if terminated:
+            # Normalize by number of waypoints
+            efficiency_bonus = (self.n_waypoints * 1000.0 - self.total_cost) / 10000.0
+            reward += efficiency_bonus
+
+        obs = self._get_observation()
+        return obs, reward, terminated, False, {}
+
+
+class RLOptimizer:
+    """
+    Reinforcement Learning-based optimizer using Stable-Baselines3.
+    Provides state-of-the-art RL algorithms for waypoint sequencing.
+    """
+
+    @staticmethod
+    def train_rl_agent(waypoints: List[Waypoint],
+                      start_pos: Tuple[float, float],
+                      planner: 'GridConstrainedPlanner',
+                      objective: str = 'energy',
+                      algorithm: str = 'PPO',
+                      total_timesteps: int = 10000) -> List[Waypoint]:
+        """
+        Train an RL agent to optimize waypoint sequencing.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints
+        start_pos: Starting position
+        planner: Planner instance
+        objective: 'energy', 'distance', or 'time'
+        algorithm: 'PPO', 'A2C', or 'SAC'
+        total_timesteps: Training timesteps
+
+        Returns:
+        --------
+        Optimized waypoint sequence
+        """
+        if not SB3_AVAILABLE:
+            print("   Stable-Baselines3 not available, using fallback SA optimizer...")
+            return EnergyAwareOptimizer.simulated_annealing_tsp(
+                waypoints, start_pos, planner, objective=objective, max_iterations=500
+            )
+
+        if not waypoints:
+            return []
+
+        # Create environment
+        env = WaypointSequencingEnv(waypoints, start_pos, planner, objective)
+
+        # Select algorithm
+        if algorithm == 'PPO':
+            model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.0003)
+        elif algorithm == 'A2C':
+            model = A2C('MlpPolicy', env, verbose=0, learning_rate=0.0003)
+        else:  # SAC (for continuous but we adapt)
+            model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.0003)
+
+        # Train the agent
+        model.learn(total_timesteps=total_timesteps)
+
+        # Generate optimized sequence
+        obs, _ = env.reset()
+        sequence = []
+        done = False
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+        return env.sequence
+
 class GridConstrainedPlanner:
     """Plans grid-compliant paths for vineyard navigation"""
 
@@ -677,6 +935,8 @@ class GridConstrainedPlanner:
             - 'clustering': Elevation-zone clustering with SA
             - 'two_opt': 2-opt local search improvement
             - 'multi_objective': Multi-objective energy+time optimization
+            - 'rl': Reinforcement Learning with Stable-Baselines3 (PPO/A2C)
+            - 'scipy': SciPy global optimization (dual_annealing/differential_evolution)
             - 'custom': Use provided custom_sequence
         **kwargs: Additional parameters for specific modes
 
@@ -721,6 +981,21 @@ class GridConstrainedPlanner:
                 waypoints, start_pos, self, energy_weight, time_weight
             )
             return best_seq
+        elif mode == 'rl':
+            # Reinforcement Learning optimization
+            objective = kwargs.get('objective', 'energy')
+            algorithm = kwargs.get('algorithm', 'PPO')
+            timesteps = kwargs.get('timesteps', 10000)
+            return RLOptimizer.train_rl_agent(
+                waypoints, start_pos, self, objective, algorithm, timesteps
+            )
+        elif mode == 'scipy':
+            # SciPy global optimization
+            objective = kwargs.get('objective', 'energy')
+            method = kwargs.get('scipy_method', 'dual_annealing')
+            return EnergyAwareOptimizer.scipy_optimize_tsp(
+                waypoints, start_pos, self, objective, method
+            )
         else:  # nearest_neighbor (default)
             return self._sequence_by_nearest_neighbor(waypoints, start_pos)
 

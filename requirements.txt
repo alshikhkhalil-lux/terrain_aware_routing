@@ -1,0 +1,12 @@
+# Core dependencies
+numpy>=1.24.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+
+# Reinforcement Learning
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+torch>=2.0.0
+
+# Optional: for better performance
+# tensorboard>=2.13.0  # For RL training visualization
