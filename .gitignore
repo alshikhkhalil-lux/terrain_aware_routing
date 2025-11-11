@@ -64,7 +64,7 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Output files (optional - uncomment if you don't want to track them)
-# *.png
-# *.gif
-# *.pdf
+# Generated output files
+*.png
+*.gif
+*.pdf

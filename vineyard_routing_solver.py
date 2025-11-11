@@ -55,7 +55,6 @@ class BatteryState:
     capacity_wh: float  # Total battery capacity in Watt-hours
     current_soc: float = 1.0  # State of charge (0-1)
     energy_used_j: float = 0.0  # Energy consumed in Joules
-    regenerated_j: float = 0.0  # Energy regenerated in Joules
 
     def get_remaining_wh(self) -> float:
         """Get remaining energy in Watt-hours"""
@@ -77,21 +76,6 @@ class BatteryState:
         self.energy_used_j += energy_j
         self.current_soc -= energy_wh / self.capacity_wh
         return True
-
-    def regenerate_energy(self, energy_j: float, efficiency: float = 0.7):
-        """
-        Regenerate energy through braking.
-        efficiency: typical 60-80% for regenerative braking
-        """
-        recoverable_j = energy_j * efficiency
-        recoverable_wh = recoverable_j / 3600.0
-
-        # Don't exceed 100% SOC
-        max_recoverable_wh = self.capacity_wh * (1.0 - self.current_soc)
-        actual_wh = min(recoverable_wh, max_recoverable_wh)
-
-        self.regenerated_j += actual_wh * 3600
-        self.current_soc += actual_wh / self.capacity_wh
 
 class ElevationModel:
     """Models vineyard terrain elevation"""
@@ -677,7 +661,6 @@ class GridConstrainedPlanner:
         self.rolling_resistance = 0.15  # coefficient for rough terrain
         self.mechanical_efficiency = 0.75  # motor/drivetrain efficiency
         self.air_resistance_coeff = 0.5  # Cd * A (drag coefficient * frontal area)
-        self.regen_braking_efficiency = 0.7  # regenerative braking efficiency (60-80% typical)
         
     def sequence_waypoints(self, waypoints: List[Waypoint], start_pos: Tuple[float, float], mode: str = 'nearest_neighbor', **kwargs) -> List[Waypoint]:
         """
@@ -962,14 +945,9 @@ class GridConstrainedPlanner:
 
         return all_segments, metrics
     
-    def calculate_energy_for_segment(self, seg: GridSegment, use_regen_braking: bool = True) -> dict:
+    def calculate_energy_for_segment(self, seg: GridSegment) -> dict:
         """
-        Calculate energy consumption for a single segment with regenerative braking.
-
-        Parameters:
-        -----------
-        seg: GridSegment to analyze
-        use_regen_braking: If True, recover energy when descending
+        Calculate energy consumption for a single segment.
 
         Returns:
         --------
@@ -987,22 +965,9 @@ class GridConstrainedPlanner:
         # E_potential = m * g * Δh
         potential_energy = self.ugv_mass * self.g * elevation_change
 
-        # Separate climbing and descending
-        if elevation_change > 0:
-            # Climbing: requires energy
-            climbing_energy = potential_energy
-            descending_energy = 0.0
-            regen_recovered = 0.0
-        else:
-            # Descending: can recover energy
-            climbing_energy = 0.0
-            descending_energy = abs(potential_energy)
-
-            if use_regen_braking:
-                # Regenerative braking recovers some energy
-                regen_recovered = descending_energy * self.regen_braking_efficiency
-            else:
-                regen_recovered = 0.0
+        # Only count energy when climbing (positive elevation change)
+        # Descending can use coasting/braking (no energy cost modeled)
+        climbing_energy = max(0, potential_energy)
 
         # 2. Rolling resistance energy (always consumed)
         # E_rolling = m * g * C_rr * distance
@@ -1014,11 +979,9 @@ class GridConstrainedPlanner:
         air_resistance_energy = 0.5 * self.air_resistance_coeff * (self.velocity ** 2) * distance
 
         # 4. Total mechanical energy required
-        # Climbing costs energy, regenerative braking recovers some
-        mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy - regen_recovered
+        mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy
 
         # 5. Account for mechanical efficiency (motors, drivetrain losses)
-        # Efficiency applies to both consumption and regeneration
         total_energy = mechanical_energy / self.mechanical_efficiency
 
         return {
@@ -1026,8 +989,6 @@ class GridConstrainedPlanner:
             'elevation_change': elevation_change,
             'potential_energy': potential_energy,
             'climbing_energy': climbing_energy,
-            'descending_energy': descending_energy,
-            'regen_recovered': regen_recovered,
             'rolling_energy': rolling_energy,
             'air_resistance_energy': air_resistance_energy,
             'mechanical_energy': mechanical_energy,
@@ -1036,7 +997,7 @@ class GridConstrainedPlanner:
 
     def calculate_metrics(self, segments: List[GridSegment], battery: Optional[BatteryState] = None) -> dict:
         """
-        Calculate path metrics including distance, time, and energy with regenerative braking.
+        Calculate path metrics including distance, time, and energy.
 
         Parameters:
         -----------
@@ -1070,22 +1031,18 @@ class GridConstrainedPlanner:
         turn_time = num_turns * self.turn_time
         total_time = travel_time + turn_time
 
-        # Calculate energy consumption with regenerative braking
+        # Calculate energy consumption
         total_energy = 0.0
         total_climbing_energy = 0.0
-        total_descending_energy = 0.0
-        total_regen_recovered = 0.0
         total_rolling_energy = 0.0
         total_air_energy = 0.0
         total_elevation_gain = 0.0
         total_elevation_loss = 0.0
 
         for seg in segments:
-            energy_data = self.calculate_energy_for_segment(seg, use_regen_braking=True)
+            energy_data = self.calculate_energy_for_segment(seg)
             total_energy += energy_data['total_energy']
             total_climbing_energy += energy_data['climbing_energy']
-            total_descending_energy += energy_data.get('descending_energy', 0.0)
-            total_regen_recovered += energy_data.get('regen_recovered', 0.0)
             total_rolling_energy += energy_data['rolling_energy']
             total_air_energy += energy_data['air_resistance_energy']
 
@@ -1098,11 +1055,6 @@ class GridConstrainedPlanner:
             # Update battery if provided
             if battery:
                 battery.consume_energy(energy_data['total_energy'])
-                if energy_data.get('regen_recovered', 0) > 0:
-                    battery.regenerate_energy(
-                        energy_data.get('descending_energy', 0),
-                        self.regen_braking_efficiency
-                    )
 
         # Energy for turns (motors working during rotation)
         # Assume ~50W power during a turn
@@ -1128,8 +1080,6 @@ class GridConstrainedPlanner:
             'total_energy_kj': energy_kj,
             'total_energy_kwh': energy_kwh,
             'climbing_energy_j': total_climbing_energy,
-            'descending_energy_j': total_descending_energy,
-            'regen_recovered_j': total_regen_recovered,
             'rolling_energy_j': total_rolling_energy,
             'air_resistance_energy_j': total_air_energy,
             'turn_energy_j': turn_energy,
@@ -1142,7 +1092,6 @@ class GridConstrainedPlanner:
             metrics['battery_soc'] = battery.current_soc
             metrics['battery_remaining_wh'] = battery.get_remaining_wh()
             metrics['battery_used_wh'] = battery.energy_used_j / 3600.0
-            metrics['battery_regenerated_wh'] = battery.regenerated_j / 3600.0
 
         return metrics
 
@@ -1318,12 +1267,6 @@ class VineyardVisualizer:
         text += f"Total Energy: {metrics['total_energy_kj']:.2f} kJ\n"
         text += f"             ({metrics['total_energy_kwh']*1000:.2f} Wh)\n"
         text += f"Climbing: {metrics['climbing_energy_j']/1000:.2f} kJ\n"
-
-        # Show regenerative braking if available
-        if 'regen_recovered_j' in metrics and metrics['regen_recovered_j'] > 0:
-            text += f"Descending: {metrics['descending_energy_j']/1000:.2f} kJ\n"
-            text += f"Regen Braking: -{metrics['regen_recovered_j']/1000:.2f} kJ\n"
-
         text += f"Rolling: {metrics['rolling_energy_j']/1000:.2f} kJ\n"
         text += f"Air Drag: {metrics['air_resistance_energy_j']/1000:.2f} kJ\n"
         text += f"Turns: {metrics['turn_energy_j']/1000:.2f} kJ\n"
@@ -1334,7 +1277,6 @@ class VineyardVisualizer:
             text += f"━━━━━━━━━━━━━━━━━━━━━\n"
             text += f"SOC: {metrics['battery_soc']*100:.1f}%\n"
             text += f"Remaining: {metrics['battery_remaining_wh']:.1f} Wh\n"
-            text += f"Regenerated: {metrics.get('battery_regenerated_wh', 0):.1f} Wh\n"
 
         text += f"\nElevation:\n"
         text += f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1935,19 +1877,17 @@ def main():
             'Multi-Objective (0.7/0.3)': metrics_multi
         }
 
-        print("\n{:<30} {:>12} {:>12} {:>12} {:>12}".format(
-            "Strategy", "Energy (kJ)", "Time (min)", "Distance (m)", "Regen (kJ)"
+        print("\n{:<30} {:>12} {:>12} {:>12}".format(
+            "Strategy", "Energy (kJ)", "Time (min)", "Distance (m)"
         ))
-        print("-" * 82)
+        print("-" * 70)
 
         for name, m in strategies.items():
-            regen = m.get('regen_recovered_j', 0) / 1000.0
-            print("{:<30} {:>12.2f} {:>12.1f} {:>12.1f} {:>12.2f}".format(
+            print("{:<30} {:>12.2f} {:>12.1f} {:>12.1f}".format(
                 name,
                 m['total_energy_kj'],
                 m['total_time'] / 60.0,
-                m['total_distance_3d'],
-                regen
+                m['total_distance_3d']
             ))
 
         # Find best strategies
@@ -1977,7 +1917,6 @@ def main():
             print(f"\n{name}:")
             print(f"  Energy: {energy_save:+.1f}%")
             print(f"  Time: {time_diff:+.1f}%")
-            print(f"  Regenerated: {m.get('regen_recovered_j', 0)/1000:.2f} kJ")
 
         # Use best energy strategy for visualization
         better_strategy = best_energy[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
@@ -2017,25 +1956,15 @@ def main():
     print(f"Average effective speed: {metrics['total_distance']/metrics['total_time']:.2f} m/s")
 
     print(f"\n{'='*70}")
-    print("ENERGY CONSUMPTION (with Regenerative Braking)")
+    print("ENERGY CONSUMPTION")
     print("="*70)
-    print(f"Total Net Energy: {metrics['total_energy_kj']:.2f} kJ ({metrics['total_energy_kwh']*1000:.2f} Wh)")
-    print(f"\nEnergy Consumed:")
-    print(f"  - Climbing hills: {metrics['climbing_energy_j']/1000:.2f} kJ")
-    print(f"  - Rolling resistance: {metrics['rolling_energy_j']/1000:.2f} kJ")
-    print(f"  - Air resistance: {metrics['air_resistance_energy_j']/1000:.2f} kJ")
-    print(f"  - Turning maneuvers: {metrics['turn_energy_j']/1000:.2f} kJ")
-
-    # Show regenerative braking
-    if 'regen_recovered_j' in metrics and metrics['regen_recovered_j'] > 0:
-        print(f"\nEnergy Recovered:")
-        print(f"  - Descending potential: {metrics['descending_energy_j']/1000:.2f} kJ (available)")
-        print(f"  - Regenerative braking: {metrics['regen_recovered_j']/1000:.2f} kJ (recovered at 70% efficiency)")
-        print(f"  - Recovery rate: {(metrics['regen_recovered_j']/metrics['descending_energy_j'])*100:.1f}%")
-
-    print(f"\nEnergy Efficiency:")
-    print(f"  - Energy per distance: {metrics['total_energy_kj']/metrics['total_distance']*1000:.2f} J/m")
-    print(f"  - Average power: {metrics['total_energy_j']/metrics['total_time']:.2f} W")
+    print(f"Total Energy: {metrics['total_energy_kj']:.2f} kJ ({metrics['total_energy_kwh']*1000:.2f} Wh)")
+    print(f"  - Climbing hills: {metrics['climbing_energy_j']/1000:.2f} kJ ({metrics['climbing_energy_j']/metrics['total_energy_j']*100:.1f}%)")
+    print(f"  - Rolling resistance: {metrics['rolling_energy_j']/1000:.2f} kJ ({metrics['rolling_energy_j']/metrics['total_energy_j']*100:.1f}%)")
+    print(f"  - Air resistance: {metrics['air_resistance_energy_j']/1000:.2f} kJ ({metrics['air_resistance_energy_j']/metrics['total_energy_j']*100:.1f}%)")
+    print(f"  - Turning maneuvers: {metrics['turn_energy_j']/1000:.2f} kJ ({metrics['turn_energy_j']/metrics['total_energy_j']*100:.1f}%)")
+    print(f"Energy per distance: {metrics['total_energy_kj']/metrics['total_distance']*1000:.2f} J/m")
+    print(f"Average power: {metrics['total_energy_j']/metrics['total_time']:.2f} W")
 
     # Calculate elevation statistics
     elevations = [wp.z for wp in waypoints]
