@@ -11,6 +11,8 @@ import random
 from collections import defaultdict
 from scipy.interpolate import RectBivariateSpline
 from functools import lru_cache
+import heapq
+from copy import deepcopy
 
 class SegmentType(Enum):
     """Types of path segments in grid navigation"""
@@ -46,6 +48,50 @@ def interpolate_segment(seg: 'GridSegment', num_points: Optional[int] = None) ->
     y_path = seg.start[1] + t * (seg.end[1] - seg.start[1])
 
     return x_path, y_path, t
+
+@dataclass
+class BatteryState:
+    """Tracks battery state during path execution"""
+    capacity_wh: float  # Total battery capacity in Watt-hours
+    current_soc: float = 1.0  # State of charge (0-1)
+    energy_used_j: float = 0.0  # Energy consumed in Joules
+    regenerated_j: float = 0.0  # Energy regenerated in Joules
+
+    def get_remaining_wh(self) -> float:
+        """Get remaining energy in Watt-hours"""
+        return self.capacity_wh * self.current_soc
+
+    def get_remaining_j(self) -> float:
+        """Get remaining energy in Joules"""
+        return self.capacity_wh * 3600 * self.current_soc
+
+    def consume_energy(self, energy_j: float) -> bool:
+        """
+        Consume energy from battery.
+        Returns True if successful, False if insufficient energy.
+        """
+        energy_wh = energy_j / 3600.0
+        if energy_wh > self.get_remaining_wh():
+            return False
+
+        self.energy_used_j += energy_j
+        self.current_soc -= energy_wh / self.capacity_wh
+        return True
+
+    def regenerate_energy(self, energy_j: float, efficiency: float = 0.7):
+        """
+        Regenerate energy through braking.
+        efficiency: typical 60-80% for regenerative braking
+        """
+        recoverable_j = energy_j * efficiency
+        recoverable_wh = recoverable_j / 3600.0
+
+        # Don't exceed 100% SOC
+        max_recoverable_wh = self.capacity_wh * (1.0 - self.current_soc)
+        actual_wh = min(recoverable_wh, max_recoverable_wh)
+
+        self.regenerated_j += actual_wh * 3600
+        self.current_soc += actual_wh / self.capacity_wh
 
 class ElevationModel:
     """Models vineyard terrain elevation"""
@@ -332,6 +378,290 @@ class VineyardGrid:
         """Check if alley ID is valid"""
         return 0 <= alley_id < self.num_rows - 1
 
+class EnergyAwareOptimizer:
+    """Advanced optimization algorithms for energy-aware waypoint sequencing"""
+
+    @staticmethod
+    def cluster_by_elevation(waypoints: List[Waypoint],
+                            num_clusters: int = 3,
+                            elevation_model: Optional['ElevationModel'] = None) -> List[List[Waypoint]]:
+        """
+        Cluster waypoints by elevation zones to minimize climbing.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints to cluster
+        num_clusters: Number of elevation zones
+        elevation_model: Optional elevation model
+
+        Returns:
+        --------
+        List of waypoint clusters, sorted by elevation
+        """
+        if not waypoints:
+            return []
+
+        # Get elevations
+        elevations = np.array([wp.z for wp in waypoints])
+
+        # Simple k-means clustering by elevation
+        min_elev = elevations.min()
+        max_elev = elevations.max()
+
+        # Create elevation bands
+        band_size = (max_elev - min_elev) / num_clusters
+        clusters = [[] for _ in range(num_clusters)]
+
+        for wp in waypoints:
+            # Assign to cluster based on elevation band
+            cluster_idx = int((wp.z - min_elev) / band_size)
+            cluster_idx = min(cluster_idx, num_clusters - 1)  # Handle edge case
+            clusters[cluster_idx].append(wp)
+
+        # Remove empty clusters and sort by mean elevation
+        clusters = [c for c in clusters if c]
+        clusters.sort(key=lambda c: np.mean([wp.z for wp in c]))
+
+        return clusters
+
+    @staticmethod
+    def simulated_annealing_tsp(waypoints: List[Waypoint],
+                                start_pos: Tuple[float, float],
+                                planner: 'GridConstrainedPlanner',
+                                objective: str = 'energy',
+                                max_iterations: int = 1000,
+                                initial_temp: float = 100.0,
+                                cooling_rate: float = 0.995) -> List[Waypoint]:
+        """
+        Use Simulated Annealing to find near-optimal waypoint sequence.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints to sequence
+        start_pos: Starting position
+        planner: Planner instance for cost calculation
+        objective: 'energy', 'distance', or 'time'
+        max_iterations: Number of iterations
+        initial_temp: Starting temperature
+        cooling_rate: Temperature decay rate
+
+        Returns:
+        --------
+        Optimized waypoint sequence
+        """
+        if not waypoints:
+            return []
+
+        # Start with random sequence
+        current_sequence = waypoints.copy()
+        random.shuffle(current_sequence)
+
+        # Calculate initial cost
+        current_cost = EnergyAwareOptimizer._calculate_sequence_cost(
+            current_sequence, start_pos, planner, objective
+        )
+
+        best_sequence = current_sequence.copy()
+        best_cost = current_cost
+
+        temperature = initial_temp
+
+        for iteration in range(max_iterations):
+            # Generate neighbor solution (2-opt swap)
+            new_sequence = current_sequence.copy()
+
+            # Random 2-opt swap
+            i, j = sorted(random.sample(range(len(new_sequence)), 2))
+            new_sequence[i:j+1] = reversed(new_sequence[i:j+1])
+
+            # Calculate new cost
+            new_cost = EnergyAwareOptimizer._calculate_sequence_cost(
+                new_sequence, start_pos, planner, objective
+            )
+
+            # Acceptance probability
+            cost_diff = new_cost - current_cost
+
+            if cost_diff < 0 or random.random() < np.exp(-cost_diff / temperature):
+                current_sequence = new_sequence
+                current_cost = new_cost
+
+                # Update best if improved
+                if current_cost < best_cost:
+                    best_sequence = current_sequence.copy()
+                    best_cost = current_cost
+
+            # Cool down
+            temperature *= cooling_rate
+
+        return best_sequence
+
+    @staticmethod
+    def _calculate_sequence_cost(sequence: List[Waypoint],
+                                 start_pos: Tuple[float, float],
+                                 planner: 'GridConstrainedPlanner',
+                                 objective: str = 'energy') -> float:
+        """Calculate cost (energy, distance, or time) for a waypoint sequence"""
+        segments, metrics = planner.plan_complete_tour(
+            sequence, start_pos, sequencing_mode='custom', custom_sequence=sequence
+        )
+
+        if objective == 'energy':
+            return metrics['total_energy_j']
+        elif objective == 'distance':
+            return metrics['total_distance']
+        elif objective == 'time':
+            return metrics['total_time']
+        else:
+            return metrics['total_energy_j']
+
+    @staticmethod
+    def two_opt_improve(waypoints: List[Waypoint],
+                       start_pos: Tuple[float, float],
+                       planner: 'GridConstrainedPlanner',
+                       objective: str = 'energy',
+                       max_iterations: int = 100) -> List[Waypoint]:
+        """
+        Apply 2-opt local search to improve waypoint sequence.
+
+        Returns:
+        --------
+        Improved waypoint sequence
+        """
+        if len(waypoints) < 3:
+            return waypoints
+
+        current_sequence = waypoints.copy()
+        improved = True
+        iteration = 0
+
+        while improved and iteration < max_iterations:
+            improved = False
+            iteration += 1
+
+            for i in range(len(current_sequence) - 1):
+                for j in range(i + 2, len(current_sequence)):
+                    # Create new sequence with reversed segment
+                    new_sequence = current_sequence.copy()
+                    new_sequence[i:j] = reversed(new_sequence[i:j])
+
+                    # Evaluate both sequences
+                    current_cost = EnergyAwareOptimizer._calculate_sequence_cost(
+                        current_sequence, start_pos, planner, objective
+                    )
+                    new_cost = EnergyAwareOptimizer._calculate_sequence_cost(
+                        new_sequence, start_pos, planner, objective
+                    )
+
+                    # Accept if improved
+                    if new_cost < current_cost:
+                        current_sequence = new_sequence
+                        improved = True
+                        break
+
+                if improved:
+                    break
+
+        return current_sequence
+
+    @staticmethod
+    def multi_objective_optimize(waypoints: List[Waypoint],
+                                start_pos: Tuple[float, float],
+                                planner: 'GridConstrainedPlanner',
+                                energy_weight: float = 0.7,
+                                time_weight: float = 0.3,
+                                max_iterations: int = 500) -> Tuple[List[Waypoint], dict]:
+        """
+        Multi-objective optimization balancing energy and time.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints
+        start_pos: Starting position
+        planner: Planner instance
+        energy_weight: Weight for energy (0-1)
+        time_weight: Weight for time (0-1)
+        max_iterations: SA iterations
+
+        Returns:
+        --------
+        Tuple of (optimized sequence, pareto_solutions)
+        """
+        # Normalize weights
+        total_weight = energy_weight + time_weight
+        energy_weight /= total_weight
+        time_weight /= total_weight
+
+        # Find sequences optimized for each objective
+        energy_optimal = EnergyAwareOptimizer.simulated_annealing_tsp(
+            waypoints, start_pos, planner, objective='energy',
+            max_iterations=max_iterations
+        )
+
+        time_optimal = EnergyAwareOptimizer.simulated_annealing_tsp(
+            waypoints, start_pos, planner, objective='time',
+            max_iterations=max_iterations
+        )
+
+        # Weighted objective function
+        def weighted_cost(sequence):
+            segments, metrics = planner.plan_complete_tour(
+                sequence, start_pos, sequencing_mode='custom',
+                custom_sequence=sequence
+            )
+
+            # Normalize by baseline (nearest neighbor)
+            baseline_seq = planner.sequence_waypoints(
+                waypoints, start_pos, mode='nearest_neighbor'
+            )
+            _, baseline_metrics = planner.plan_complete_tour(
+                baseline_seq, start_pos, sequencing_mode='custom',
+                custom_sequence=baseline_seq
+            )
+
+            norm_energy = metrics['total_energy_j'] / baseline_metrics['total_energy_j']
+            norm_time = metrics['total_time'] / baseline_metrics['total_time']
+
+            return energy_weight * norm_energy + time_weight * norm_time
+
+        # Simulated annealing with weighted objective
+        current_sequence = waypoints.copy()
+        random.shuffle(current_sequence)
+        current_cost = weighted_cost(current_sequence)
+
+        best_sequence = current_sequence.copy()
+        best_cost = current_cost
+
+        temperature = 100.0
+        cooling_rate = 0.995
+
+        for iteration in range(max_iterations):
+            new_sequence = current_sequence.copy()
+            i, j = sorted(random.sample(range(len(new_sequence)), 2))
+            new_sequence[i:j+1] = reversed(new_sequence[i:j+1])
+
+            new_cost = weighted_cost(new_sequence)
+            cost_diff = new_cost - current_cost
+
+            if cost_diff < 0 or random.random() < np.exp(-cost_diff / temperature):
+                current_sequence = new_sequence
+                current_cost = new_cost
+
+                if current_cost < best_cost:
+                    best_sequence = current_sequence.copy()
+                    best_cost = current_cost
+
+            temperature *= cooling_rate
+
+        # Return best weighted solution and pareto solutions
+        pareto_solutions = {
+            'energy_optimal': energy_optimal,
+            'time_optimal': time_optimal,
+            'weighted_optimal': best_sequence
+        }
+
+        return best_sequence, pareto_solutions
+
 class GridConstrainedPlanner:
     """Plans grid-compliant paths for vineyard navigation"""
 
@@ -347,8 +677,9 @@ class GridConstrainedPlanner:
         self.rolling_resistance = 0.15  # coefficient for rough terrain
         self.mechanical_efficiency = 0.75  # motor/drivetrain efficiency
         self.air_resistance_coeff = 0.5  # Cd * A (drag coefficient * frontal area)
+        self.regen_braking_efficiency = 0.7  # regenerative braking efficiency (60-80% typical)
         
-    def sequence_waypoints(self, waypoints: List[Waypoint], start_pos: Tuple[float, float], mode: str = 'nearest_neighbor') -> List[Waypoint]:
+    def sequence_waypoints(self, waypoints: List[Waypoint], start_pos: Tuple[float, float], mode: str = 'nearest_neighbor', **kwargs) -> List[Waypoint]:
         """
         Phase 1: Sequence waypoints using different strategies
 
@@ -356,15 +687,58 @@ class GridConstrainedPlanner:
         -----------
         waypoints: List of waypoints to sequence
         start_pos: Starting position
-        mode: 'nearest_neighbor' or 'elevation' - sequencing strategy
+        mode: Sequencing strategy:
+            - 'nearest_neighbor': Greedy alley clustering
+            - 'elevation': Greedy elevation minimization
+            - 'simulated_annealing': SA optimization for energy/time/distance
+            - 'clustering': Elevation-zone clustering with SA
+            - 'two_opt': 2-opt local search improvement
+            - 'multi_objective': Multi-objective energy+time optimization
+            - 'custom': Use provided custom_sequence
+        **kwargs: Additional parameters for specific modes
 
         Returns:
         --------
         Ordered list of waypoints
         """
-        if mode == 'elevation':
+        if mode == 'custom' and 'custom_sequence' in kwargs:
+            return kwargs['custom_sequence']
+        elif mode == 'elevation':
             return self._sequence_by_elevation(waypoints, start_pos)
-        else:  # nearest_neighbor
+        elif mode == 'simulated_annealing':
+            objective = kwargs.get('objective', 'energy')
+            max_iterations = kwargs.get('max_iterations', 1000)
+            return EnergyAwareOptimizer.simulated_annealing_tsp(
+                waypoints, start_pos, self, objective, max_iterations
+            )
+        elif mode == 'clustering':
+            num_clusters = kwargs.get('num_clusters', 3)
+            clusters = EnergyAwareOptimizer.cluster_by_elevation(
+                waypoints, num_clusters, self.elevation
+            )
+            # Sequence within each cluster and combine
+            sequence = []
+            for cluster in clusters:
+                cluster_seq = EnergyAwareOptimizer.simulated_annealing_tsp(
+                    cluster, start_pos, self, objective='energy',
+                    max_iterations=500
+                )
+                sequence.extend(cluster_seq)
+            return sequence
+        elif mode == 'two_opt':
+            # Start with nearest neighbor and improve
+            initial_seq = self._sequence_by_nearest_neighbor(waypoints, start_pos)
+            return EnergyAwareOptimizer.two_opt_improve(
+                initial_seq, start_pos, self, objective='energy'
+            )
+        elif mode == 'multi_objective':
+            energy_weight = kwargs.get('energy_weight', 0.7)
+            time_weight = kwargs.get('time_weight', 0.3)
+            best_seq, pareto = EnergyAwareOptimizer.multi_objective_optimize(
+                waypoints, start_pos, self, energy_weight, time_weight
+            )
+            return best_seq
+        else:  # nearest_neighbor (default)
             return self._sequence_by_nearest_neighbor(waypoints, start_pos)
 
     def _sequence_by_nearest_neighbor(self, waypoints: List[Waypoint], start_pos: Tuple[float, float]) -> List[Waypoint]:
@@ -545,7 +919,8 @@ class GridConstrainedPlanner:
     
     def plan_complete_tour(self, waypoints: List[Waypoint],
                           start_pos: Tuple[float, float],
-                          sequencing_mode: str = 'elevation') -> Tuple[List[GridSegment], dict]:
+                          sequencing_mode: str = 'elevation',
+                          **kwargs) -> Tuple[List[GridSegment], dict]:
         """
         Plan complete tour visiting all waypoints in alleys between rows
 
@@ -553,14 +928,15 @@ class GridConstrainedPlanner:
         -----------
         waypoints: List of waypoints to visit
         start_pos: Starting position
-        sequencing_mode: 'nearest_neighbor' or 'elevation' - waypoint ordering strategy
+        sequencing_mode: Waypoint ordering strategy (see sequence_waypoints for options)
+        **kwargs: Additional parameters passed to sequence_waypoints
 
         Returns:
         --------
         Tuple of (segments, metrics)
         """
         # Phase 1: Sequence waypoints
-        sequence = self.sequence_waypoints(waypoints, start_pos, mode=sequencing_mode)
+        sequence = self.sequence_waypoints(waypoints, start_pos, mode=sequencing_mode, **kwargs)
 
         # Phase 2: Generate grid-compliant path
         all_segments = []
@@ -586,12 +962,18 @@ class GridConstrainedPlanner:
 
         return all_segments, metrics
     
-    def calculate_energy_for_segment(self, seg: GridSegment) -> dict:
+    def calculate_energy_for_segment(self, seg: GridSegment, use_regen_braking: bool = True) -> dict:
         """
-        Calculate energy consumption for a single segment.
+        Calculate energy consumption for a single segment with regenerative braking.
+
+        Parameters:
+        -----------
+        seg: GridSegment to analyze
+        use_regen_braking: If True, recover energy when descending
 
         Returns:
-            dict with energy components in Joules (J)
+        --------
+        dict with energy components in Joules (J)
         """
         distance = seg.distance()
 
@@ -605,23 +987,38 @@ class GridConstrainedPlanner:
         # E_potential = m * g * Δh
         potential_energy = self.ugv_mass * self.g * elevation_change
 
-        # Only count energy when climbing (positive elevation change)
-        # Descending can use regenerative braking or just coasting
-        climbing_energy = max(0, potential_energy)
+        # Separate climbing and descending
+        if elevation_change > 0:
+            # Climbing: requires energy
+            climbing_energy = potential_energy
+            descending_energy = 0.0
+            regen_recovered = 0.0
+        else:
+            # Descending: can recover energy
+            climbing_energy = 0.0
+            descending_energy = abs(potential_energy)
 
-        # 2. Rolling resistance energy
+            if use_regen_braking:
+                # Regenerative braking recovers some energy
+                regen_recovered = descending_energy * self.regen_braking_efficiency
+            else:
+                regen_recovered = 0.0
+
+        # 2. Rolling resistance energy (always consumed)
         # E_rolling = m * g * C_rr * distance
         rolling_energy = self.ugv_mass * self.g * self.rolling_resistance * distance
 
-        # 3. Air resistance energy (at constant velocity)
+        # 3. Air resistance energy (at constant velocity, always consumed)
         # E_air = 0.5 * rho * Cd * A * v^2 * distance
         # Simplified: using coefficient instead of full calculation
         air_resistance_energy = 0.5 * self.air_resistance_coeff * (self.velocity ** 2) * distance
 
         # 4. Total mechanical energy required
-        mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy
+        # Climbing costs energy, regenerative braking recovers some
+        mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy - regen_recovered
 
         # 5. Account for mechanical efficiency (motors, drivetrain losses)
+        # Efficiency applies to both consumption and regeneration
         total_energy = mechanical_energy / self.mechanical_efficiency
 
         return {
@@ -629,14 +1026,27 @@ class GridConstrainedPlanner:
             'elevation_change': elevation_change,
             'potential_energy': potential_energy,
             'climbing_energy': climbing_energy,
+            'descending_energy': descending_energy,
+            'regen_recovered': regen_recovered,
             'rolling_energy': rolling_energy,
             'air_resistance_energy': air_resistance_energy,
             'mechanical_energy': mechanical_energy,
             'total_energy': total_energy
         }
 
-    def calculate_metrics(self, segments: List[GridSegment]) -> dict:
-        """Calculate path metrics including distance, time, and energy (optimized)"""
+    def calculate_metrics(self, segments: List[GridSegment], battery: Optional[BatteryState] = None) -> dict:
+        """
+        Calculate path metrics including distance, time, and energy with regenerative braking.
+
+        Parameters:
+        -----------
+        segments: List of path segments
+        battery: Optional battery state to track energy consumption
+
+        Returns:
+        --------
+        dict with comprehensive metrics
+        """
         # Calculate both 2D and 3D distances (use elevation model for accurate 3D calculation)
         total_distance_2d = sum(seg.distance() for seg in segments)
         total_distance_3d = sum(seg.distance_3d(self.elevation) for seg in segments)
@@ -660,18 +1070,22 @@ class GridConstrainedPlanner:
         turn_time = num_turns * self.turn_time
         total_time = travel_time + turn_time
 
-        # Calculate energy consumption
+        # Calculate energy consumption with regenerative braking
         total_energy = 0.0
         total_climbing_energy = 0.0
+        total_descending_energy = 0.0
+        total_regen_recovered = 0.0
         total_rolling_energy = 0.0
         total_air_energy = 0.0
         total_elevation_gain = 0.0
         total_elevation_loss = 0.0
 
         for seg in segments:
-            energy_data = self.calculate_energy_for_segment(seg)
+            energy_data = self.calculate_energy_for_segment(seg, use_regen_braking=True)
             total_energy += energy_data['total_energy']
             total_climbing_energy += energy_data['climbing_energy']
+            total_descending_energy += energy_data.get('descending_energy', 0.0)
+            total_regen_recovered += energy_data.get('regen_recovered', 0.0)
             total_rolling_energy += energy_data['rolling_energy']
             total_air_energy += energy_data['air_resistance_energy']
 
@@ -681,17 +1095,28 @@ class GridConstrainedPlanner:
             else:
                 total_elevation_loss += abs(energy_data['elevation_change'])
 
+            # Update battery if provided
+            if battery:
+                battery.consume_energy(energy_data['total_energy'])
+                if energy_data.get('regen_recovered', 0) > 0:
+                    battery.regenerate_energy(
+                        energy_data.get('descending_energy', 0),
+                        self.regen_braking_efficiency
+                    )
+
         # Energy for turns (motors working during rotation)
         # Assume ~50W power during a turn
         turn_energy = num_turns * 50.0 * self.turn_time  # Watts * seconds = Joules
 
         total_energy += turn_energy
+        if battery:
+            battery.consume_energy(turn_energy)
 
         # Convert to more readable units
         energy_kj = total_energy / 1000.0  # Kilojoules
         energy_kwh = total_energy / 3600000.0  # Kilowatt-hours
 
-        return {
+        metrics = {
             'total_distance': total_distance,
             'total_distance_2d': total_distance_2d,
             'total_distance_3d': total_distance_3d,
@@ -703,12 +1128,23 @@ class GridConstrainedPlanner:
             'total_energy_kj': energy_kj,
             'total_energy_kwh': energy_kwh,
             'climbing_energy_j': total_climbing_energy,
+            'descending_energy_j': total_descending_energy,
+            'regen_recovered_j': total_regen_recovered,
             'rolling_energy_j': total_rolling_energy,
             'air_resistance_energy_j': total_air_energy,
             'turn_energy_j': turn_energy,
             'total_elevation_gain': total_elevation_gain,
             'total_elevation_loss': total_elevation_loss
         }
+
+        # Add battery metrics if tracking
+        if battery:
+            metrics['battery_soc'] = battery.current_soc
+            metrics['battery_remaining_wh'] = battery.get_remaining_wh()
+            metrics['battery_used_wh'] = battery.energy_used_j / 3600.0
+            metrics['battery_regenerated_wh'] = battery.regenerated_j / 3600.0
+
+        return metrics
 
 class VineyardVisualizer:
     """Visualizes the vineyard and planned paths"""
@@ -882,11 +1318,25 @@ class VineyardVisualizer:
         text += f"Total Energy: {metrics['total_energy_kj']:.2f} kJ\n"
         text += f"             ({metrics['total_energy_kwh']*1000:.2f} Wh)\n"
         text += f"Climbing: {metrics['climbing_energy_j']/1000:.2f} kJ\n"
+
+        # Show regenerative braking if available
+        if 'regen_recovered_j' in metrics and metrics['regen_recovered_j'] > 0:
+            text += f"Descending: {metrics['descending_energy_j']/1000:.2f} kJ\n"
+            text += f"Regen Braking: -{metrics['regen_recovered_j']/1000:.2f} kJ\n"
+
         text += f"Rolling: {metrics['rolling_energy_j']/1000:.2f} kJ\n"
         text += f"Air Drag: {metrics['air_resistance_energy_j']/1000:.2f} kJ\n"
-        text += f"Turns: {metrics['turn_energy_j']/1000:.2f} kJ\n\n"
+        text += f"Turns: {metrics['turn_energy_j']/1000:.2f} kJ\n"
 
-        text += f"Elevation:\n"
+        # Show battery state if available
+        if 'battery_soc' in metrics:
+            text += f"\nBattery State:\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━━\n"
+            text += f"SOC: {metrics['battery_soc']*100:.1f}%\n"
+            text += f"Remaining: {metrics['battery_remaining_wh']:.1f} Wh\n"
+            text += f"Regenerated: {metrics.get('battery_regenerated_wh', 0):.1f} Wh\n"
+
+        text += f"\nElevation:\n"
         text += f"━━━━━━━━━━━━━━━━━━━━━\n"
         text += f"Total Gain: {metrics['total_elevation_gain']:.1f} m\n"
         text += f"Total Loss: {metrics['total_elevation_loss']:.1f} m"
@@ -1456,51 +1906,94 @@ def main():
     print("3. Planning grid-constrained tours...")
 
     if COMPARE_STRATEGIES:
-        print("\n   3a. Nearest Neighbor sequencing...")
+        print("\n   3a. Nearest Neighbor sequencing (baseline)...")
         segments_nn, metrics_nn = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='nearest_neighbor')
 
-        print("   3b. Elevation-based sequencing...")
+        print("   3b. Elevation-based greedy sequencing...")
         segments_elev, metrics_elev = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='elevation')
+
+        print("   3c. Simulated Annealing (energy-optimized)...")
+        segments_sa, metrics_sa = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=1000)
+
+        print("   3d. Elevation clustering + SA...")
+        segments_cluster, metrics_cluster = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='clustering', num_clusters=3)
+
+        print("   3e. Multi-objective optimization (70% energy, 30% time)...")
+        segments_multi, metrics_multi = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='multi_objective', energy_weight=0.7, time_weight=0.3)
 
         # Compare sequencing strategies
         print("\n" + "="*70)
         print("SEQUENCING STRATEGY COMPARISON")
         print("="*70)
 
-        print("\nNearest Neighbor Strategy:")
-        print(f"  Total Distance (3D): {metrics_nn['total_distance_3d']:.1f} m")
-        print(f"  Total Energy: {metrics_nn['total_energy_kj']:.2f} kJ")
-        print(f"  Elevation Gain: {metrics_nn['total_elevation_gain']:.1f} m")
-        print(f"  Elevation Loss: {metrics_nn['total_elevation_loss']:.1f} m")
-        print(f"  Total Time: {metrics_nn['total_time']:.1f} s ({metrics_nn['total_time']/60:.1f} min)")
+        # Create comparison table
+        strategies = {
+            'Nearest Neighbor (Baseline)': metrics_nn,
+            'Elevation Greedy': metrics_elev,
+            'Simulated Annealing': metrics_sa,
+            'Elevation Clustering': metrics_cluster,
+            'Multi-Objective (0.7/0.3)': metrics_multi
+        }
 
-        print("\nElevation-Optimized Strategy:")
-        print(f"  Total Distance (3D): {metrics_elev['total_distance_3d']:.1f} m")
-        print(f"  Total Energy: {metrics_elev['total_energy_kj']:.2f} kJ")
-        print(f"  Elevation Gain: {metrics_elev['total_elevation_gain']:.1f} m")
-        print(f"  Elevation Loss: {metrics_elev['total_elevation_loss']:.1f} m")
-        print(f"  Total Time: {metrics_elev['total_time']:.1f} s ({metrics_elev['total_time']/60:.1f} min)")
+        print("\n{:<30} {:>12} {:>12} {:>12} {:>12}".format(
+            "Strategy", "Energy (kJ)", "Time (min)", "Distance (m)", "Regen (kJ)"
+        ))
+        print("-" * 82)
 
-        print("\nComparison:")
-        dist_diff = ((metrics_elev['total_distance_3d'] - metrics_nn['total_distance_3d']) / metrics_nn['total_distance_3d']) * 100
-        energy_diff = ((metrics_elev['total_energy_kj'] - metrics_nn['total_energy_kj']) / metrics_nn['total_energy_kj']) * 100
-        elev_gain_diff = metrics_elev['total_elevation_gain'] - metrics_nn['total_elevation_gain']
-        time_diff = ((metrics_elev['total_time'] - metrics_nn['total_time']) / metrics_nn['total_time']) * 100
+        for name, m in strategies.items():
+            regen = m.get('regen_recovered_j', 0) / 1000.0
+            print("{:<30} {:>12.2f} {:>12.1f} {:>12.1f} {:>12.2f}".format(
+                name,
+                m['total_energy_kj'],
+                m['total_time'] / 60.0,
+                m['total_distance_3d'],
+                regen
+            ))
 
-        print(f"  Distance difference: {dist_diff:+.1f}%")
-        print(f"  Energy difference: {energy_diff:+.1f}%")
-        print(f"  Elevation gain difference: {elev_gain_diff:+.1f} m")
-        print(f"  Time difference: {time_diff:+.1f}%")
+        # Find best strategies
+        best_energy = min(strategies.items(), key=lambda x: x[1]['total_energy_kj'])
+        best_time = min(strategies.items(), key=lambda x: x[1]['total_time'])
+        best_distance = min(strategies.items(), key=lambda x: x[1]['total_distance_3d'])
 
-        # Determine better strategy
-        if metrics_elev['total_energy_kj'] < metrics_nn['total_energy_kj']:
-            print(f"\n  ✓ Elevation-optimized strategy saves {abs(energy_diff):.1f}% energy!")
-            better_strategy = "elevation"
+        print("\n" + "="*70)
+        print("BEST STRATEGIES:")
+        print("="*70)
+        print(f"Lowest Energy: {best_energy[0]} ({best_energy[1]['total_energy_kj']:.2f} kJ)")
+        print(f"Fastest Time: {best_time[0]} ({best_time[1]['total_time']/60:.1f} min)")
+        print(f"Shortest Distance: {best_distance[0]} ({best_distance[1]['total_distance_3d']:.1f} m)")
+
+        # Calculate improvements over baseline
+        print("\n" + "="*70)
+        print("IMPROVEMENTS OVER BASELINE (Nearest Neighbor):")
+        print("="*70)
+
+        for name, m in strategies.items():
+            if name == 'Nearest Neighbor (Baseline)':
+                continue
+
+            energy_save = ((metrics_nn['total_energy_kj'] - m['total_energy_kj']) / metrics_nn['total_energy_kj']) * 100
+            time_diff = ((m['total_time'] - metrics_nn['total_time']) / metrics_nn['total_time']) * 100
+
+            print(f"\n{name}:")
+            print(f"  Energy: {energy_save:+.1f}%")
+            print(f"  Time: {time_diff:+.1f}%")
+            print(f"  Regenerated: {m.get('regen_recovered_j', 0)/1000:.2f} kJ")
+
+        # Use best energy strategy for visualization
+        better_strategy = best_energy[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
+        if 'simulated' in better_strategy:
+            segments = segments_sa
+            metrics = metrics_sa
+        elif 'clustering' in better_strategy:
+            segments = segments_cluster
+            metrics = metrics_cluster
+        elif 'multi' in better_strategy:
+            segments = segments_multi
+            metrics = metrics_multi
+        elif 'elevation' in better_strategy and 'clustering' not in better_strategy:
             segments = segments_elev
             metrics = metrics_elev
         else:
-            print(f"\n  ✓ Nearest neighbor strategy uses {abs(energy_diff):.1f}% less energy")
-            better_strategy = "nearest_neighbor"
             segments = segments_nn
             metrics = metrics_nn
     else:
@@ -1524,15 +2017,25 @@ def main():
     print(f"Average effective speed: {metrics['total_distance']/metrics['total_time']:.2f} m/s")
 
     print(f"\n{'='*70}")
-    print("ENERGY CONSUMPTION")
+    print("ENERGY CONSUMPTION (with Regenerative Braking)")
     print("="*70)
-    print(f"Total Energy: {metrics['total_energy_kj']:.2f} kJ ({metrics['total_energy_kwh']*1000:.2f} Wh)")
-    print(f"  - Climbing hills: {metrics['climbing_energy_j']/1000:.2f} kJ ({metrics['climbing_energy_j']/metrics['total_energy_j']*100:.1f}%)")
-    print(f"  - Rolling resistance: {metrics['rolling_energy_j']/1000:.2f} kJ ({metrics['rolling_energy_j']/metrics['total_energy_j']*100:.1f}%)")
-    print(f"  - Air resistance: {metrics['air_resistance_energy_j']/1000:.2f} kJ ({metrics['air_resistance_energy_j']/metrics['total_energy_j']*100:.1f}%)")
-    print(f"  - Turning maneuvers: {metrics['turn_energy_j']/1000:.2f} kJ ({metrics['turn_energy_j']/metrics['total_energy_j']*100:.1f}%)")
-    print(f"Energy per distance: {metrics['total_energy_kj']/metrics['total_distance']*1000:.2f} J/m")
-    print(f"Average power: {metrics['total_energy_j']/metrics['total_time']:.2f} W")
+    print(f"Total Net Energy: {metrics['total_energy_kj']:.2f} kJ ({metrics['total_energy_kwh']*1000:.2f} Wh)")
+    print(f"\nEnergy Consumed:")
+    print(f"  - Climbing hills: {metrics['climbing_energy_j']/1000:.2f} kJ")
+    print(f"  - Rolling resistance: {metrics['rolling_energy_j']/1000:.2f} kJ")
+    print(f"  - Air resistance: {metrics['air_resistance_energy_j']/1000:.2f} kJ")
+    print(f"  - Turning maneuvers: {metrics['turn_energy_j']/1000:.2f} kJ")
+
+    # Show regenerative braking
+    if 'regen_recovered_j' in metrics and metrics['regen_recovered_j'] > 0:
+        print(f"\nEnergy Recovered:")
+        print(f"  - Descending potential: {metrics['descending_energy_j']/1000:.2f} kJ (available)")
+        print(f"  - Regenerative braking: {metrics['regen_recovered_j']/1000:.2f} kJ (recovered at 70% efficiency)")
+        print(f"  - Recovery rate: {(metrics['regen_recovered_j']/metrics['descending_energy_j'])*100:.1f}%")
+
+    print(f"\nEnergy Efficiency:")
+    print(f"  - Energy per distance: {metrics['total_energy_kj']/metrics['total_distance']*1000:.2f} J/m")
+    print(f"  - Average power: {metrics['total_energy_j']/metrics['total_time']:.2f} W")
 
     # Calculate elevation statistics
     elevations = [wp.z for wp in waypoints]
