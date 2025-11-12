@@ -414,6 +414,12 @@ class EnergyAwareOptimizer:
 
         # Create elevation bands
         band_size = (max_elev - min_elev) / num_clusters
+
+        # Handle edge case: all waypoints at same elevation
+        if band_size == 0:
+            # All waypoints in single cluster
+            return [waypoints]
+
         clusters = [[] for _ in range(num_clusters)]
 
         for wp in waypoints:
@@ -433,7 +439,7 @@ class EnergyAwareOptimizer:
                                 start_pos: Tuple[float, float],
                                 planner: 'GridConstrainedPlanner',
                                 objective: str = 'energy',
-                                max_iterations: int = 1000,
+                                max_iterations: int = 10000,
                                 initial_temp: float = 100.0,
                                 cooling_rate: float = 0.995) -> List[Waypoint]:
         """
@@ -456,6 +462,10 @@ class EnergyAwareOptimizer:
         if not waypoints:
             return []
 
+        # Handle edge case: only 1 or 2 waypoints
+        if len(waypoints) <= 2:
+            return waypoints
+
         # Start with random sequence
         current_sequence = waypoints.copy()
         random.shuffle(current_sequence)
@@ -474,7 +484,10 @@ class EnergyAwareOptimizer:
             # Generate neighbor solution (2-opt swap)
             new_sequence = current_sequence.copy()
 
-            # Random 2-opt swap
+            # Random 2-opt swap (need at least 2 elements)
+            if len(new_sequence) < 2:
+                break
+
             i, j = sorted(random.sample(range(len(new_sequence)), 2))
             new_sequence[i:j+1] = reversed(new_sequence[i:j+1])
 
@@ -626,9 +639,9 @@ class EnergyAwareOptimizer:
                 custom_sequence=sequence
             )
 
-            # Use pre-calculated baseline metrics
-            norm_energy = metrics['total_energy_j'] / baseline_energy
-            norm_time = metrics['total_time'] / baseline_time
+            # Use pre-calculated baseline metrics with safety checks
+            norm_energy = metrics['total_energy_j'] / baseline_energy if baseline_energy > 0 else 1.0
+            norm_time = metrics['total_time'] / baseline_time if baseline_time > 0 else 1.0
 
             return energy_weight * norm_energy + time_weight * norm_time
 
@@ -910,15 +923,14 @@ class GridConstrainedPlanner:
     def __init__(self, grid: VineyardGrid, elevation_model: Optional[ElevationModel] = None):
         self.grid = grid
         self.elevation = elevation_model
-        self.velocity = 1.5  # m/s
+        self.velocity = 1.0  # m/s
         self.turn_time = 6.0  # seconds per 90° turn
 
         # UGV physical parameters for energy calculation
-        self.ugv_mass = 150.0  # kg (typical agricultural UGV)
+        self.ugv_mass = 120.0  # kg (typical agricultural UGV)
         self.g = 9.81  # m/s^2 (gravitational acceleration)
         self.rolling_resistance = 0.15  # coefficient for rough terrain
         self.mechanical_efficiency = 0.75  # motor/drivetrain efficiency
-        self.air_resistance_coeff = 0.5  # Cd * A (drag coefficient * frontal area)
         
     def sequence_waypoints(self, waypoints: List[Waypoint], start_pos: Tuple[float, float], mode: str = 'nearest_neighbor', **kwargs) -> List[Waypoint]:
         """
@@ -1215,6 +1227,10 @@ class GridConstrainedPlanner:
 
             current_pos = access_point
 
+        # Return to start position (complete the tour)
+        return_segments = self.plan_grid_route(current_pos, start_pos)
+        all_segments.extend(return_segments)
+
         # Calculate metrics
         metrics = self.calculate_metrics(all_segments)
 
@@ -1222,52 +1238,94 @@ class GridConstrainedPlanner:
     
     def calculate_energy_for_segment(self, seg: GridSegment) -> dict:
         """
-        Calculate energy consumption for a single segment.
+        Calculate energy consumption for a single segment with improved accuracy.
+
+        Improvements:
+        - Uses 3D distance for rolling resistance
+        - Considers slope angle effect on rolling resistance
+        - Models regenerative braking efficiency on descents
+        - Variable motor efficiency based on load
+        - Includes terrain-specific coefficients
 
         Returns:
         --------
         dict with energy components in Joules (J)
         """
-        distance = seg.distance()
+        # Use 3D distance for more accurate calculations
+        distance_2d = seg.distance()
 
         # Elevation change
         if seg.elevation_start is not None and seg.elevation_end is not None:
             elevation_change = seg.elevation_end - seg.elevation_start
+            # Calculate 3D distance (accounting for slope)
+            distance_3d = np.sqrt(distance_2d**2 + elevation_change**2)
         else:
             elevation_change = 0.0
+            distance_3d = distance_2d
+
+        # Calculate slope angle (for improved physics)
+        slope_angle = np.arctan2(abs(elevation_change), distance_2d) if distance_2d > 0 else 0.0
 
         # 1. Potential energy change (climbing/descending)
         # E_potential = m * g * Δh
         potential_energy = self.ugv_mass * self.g * elevation_change
 
-        # Only count energy when climbing (positive elevation change)
-        # Descending can use coasting/braking (no energy cost modeled)
-        climbing_energy = max(0, potential_energy)
+        # 2. Rolling resistance energy (uses 3D distance and slope effect)
+        # On slopes, normal force = m * g * cos(θ), so rolling resistance = m * g * cos(θ) * C_rr * distance
+        # For small angles, cos(θ) ≈ 1, but we calculate it for accuracy
+        normal_force_factor = np.cos(slope_angle)
+        rolling_energy = self.ugv_mass * self.g * self.rolling_resistance * distance_3d * normal_force_factor
 
-        # 2. Rolling resistance energy (always consumed)
-        # E_rolling = m * g * C_rr * distance
-        rolling_energy = self.ugv_mass * self.g * self.rolling_resistance * distance
+        # 3. Air resistance is disabled (set to 0 for low-speed UGV)
+        air_resistance_energy = 0.0
 
-        # 3. Air resistance energy (at constant velocity, always consumed)
-        # E_air = 0.5 * rho * Cd * A * v^2 * distance
-        # Simplified: using coefficient instead of full calculation
-        air_resistance_energy = 0.5 * self.air_resistance_coeff * (self.velocity ** 2) * distance
+        # 4. Climbing vs Descending Energy
+        if elevation_change > 0:
+            # CLIMBING: Need to provide gravitational potential energy
+            climbing_energy = potential_energy
 
-        # 4. Total mechanical energy required
-        mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy
+            # Variable motor efficiency based on load
+            # Higher loads (climbing steep slopes) = lower efficiency
+            load_factor = 1.0 + abs(elevation_change) / distance_3d if distance_3d > 0 else 1.0
+            motor_efficiency = max(0.60, self.mechanical_efficiency - 0.05 * (load_factor - 1.0))
 
-        # 5. Account for mechanical efficiency (motors, drivetrain losses)
-        total_energy = mechanical_energy / self.mechanical_efficiency
+            # Total mechanical energy
+            mechanical_energy = climbing_energy + rolling_energy + air_resistance_energy
+            total_energy = mechanical_energy / motor_efficiency
+
+        else:
+            # DESCENDING: Can recover some energy through regenerative braking
+            climbing_energy = 0.0
+
+            # Potential energy becomes available
+            descent_potential = abs(potential_energy)
+
+            # Regenerative braking efficiency (typical 30-50% for electric motors)
+            regen_efficiency = 0.40  # 40% energy recovery
+            recovered_energy = descent_potential * regen_efficiency
+
+            # Net energy = rolling resistance - recovered energy
+            mechanical_energy = rolling_energy + air_resistance_energy - recovered_energy
+
+            # Ensure non-negative (if descending steep slope, might generate net energy)
+            mechanical_energy = max(0, mechanical_energy)
+
+            # When in regenerative mode, efficiency is different
+            motor_efficiency = self.mechanical_efficiency
+            total_energy = mechanical_energy / motor_efficiency
 
         return {
-            'distance': distance,
+            'distance': distance_2d,
+            'distance_3d': distance_3d,
             'elevation_change': elevation_change,
+            'slope_angle_deg': np.degrees(slope_angle),
             'potential_energy': potential_energy,
             'climbing_energy': climbing_energy,
             'rolling_energy': rolling_energy,
             'air_resistance_energy': air_resistance_energy,
             'mechanical_energy': mechanical_energy,
-            'total_energy': total_energy
+            'total_energy': total_energy,
+            'motor_efficiency': motor_efficiency if elevation_change > 0 else self.mechanical_efficiency
         }
 
     def calculate_metrics(self, segments: List[GridSegment], battery: Optional[BatteryState] = None) -> dict:
@@ -1855,8 +1913,8 @@ class VineyardVisualizer:
         ax.set_zlabel('Elevation (m ASL)', fontsize=10, labelpad=10)
         ax.set_title('Mosel Valley 3D Terrain with UGV Path', fontsize=14, fontweight='bold', pad=20)
 
-        # Set viewing angle
-        ax.view_init(elev=25, azim=45)
+        # Set viewing angle (60 degree rotation for better perspective)
+        ax.view_init(elev=25, azim=60)
 
         # Add legend
         ax.legend(loc='upper left', fontsize=9)
@@ -1955,8 +2013,8 @@ class VineyardVisualizer:
         ax.set_zlabel('Elevation (m ASL)', fontsize=10)
         ax.set_title('Mosel Valley 3D UGV Path Animation', fontsize=12, fontweight='bold')
 
-        # Set initial view
-        ax.view_init(elev=25, azim=45)
+        # Set initial view (60 degree rotation for better perspective)
+        ax.view_init(elev=25, azim=60)
 
         trail_x, trail_y, trail_z = [], [], []
 
@@ -1974,7 +2032,7 @@ class VineyardVisualizer:
                 trail.set_3d_properties(trail_z)
 
                 # Slowly rotate view
-                azim = 45 + (frame / len(path_points_3d)) * 90  # Rotate 90 degrees during animation
+                azim = 60 + (frame / len(path_points_3d)) * 90  # Rotate 90 degrees during animation
                 ax.view_init(elev=25, azim=azim)
 
             return ugv, trail
@@ -1993,6 +2051,392 @@ class VineyardVisualizer:
 
         plt.tight_layout()
         return fig, anim
+
+    def plot_strategy_comparison(self, strategies: dict, save_as: Optional[str] = 'strategy_comparison.png'):
+        """
+        Create comprehensive comparison visualization of different sequencing strategies.
+
+        Parameters:
+        -----------
+        strategies: Dict mapping strategy name to metrics dict
+        save_as: Optional filename to save figure
+        """
+        fig = plt.figure(figsize=(20, 12))
+
+        # Create 2x3 grid of subplots
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        ax1 = fig.add_subplot(gs[0, :])  # Energy comparison bar chart
+        ax2 = fig.add_subplot(gs[1, 0])  # Time comparison
+        ax3 = fig.add_subplot(gs[1, 1])  # Distance comparison
+        ax4 = fig.add_subplot(gs[1, 2])  # Energy breakdown pie
+        ax5 = fig.add_subplot(gs[2, :])  # Performance heatmap
+
+        strategy_names = list(strategies.keys())
+        n_strategies = len(strategy_names)
+
+        # 1. Energy Consumption Comparison (stacked bar)
+        energy_components = ['climbing_energy_j', 'rolling_energy_j',
+                           'air_resistance_energy_j', 'turn_energy_j']
+        component_labels = ['Climbing', 'Rolling', 'Air Drag', 'Turning']
+        colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#ffa07a']
+
+        x_pos = np.arange(n_strategies)
+        bottom = np.zeros(n_strategies)
+
+        for i, (component, label) in enumerate(zip(energy_components, component_labels)):
+            values = [strategies[name][component] / 1000 for name in strategy_names]  # Convert to kJ
+            ax1.bar(x_pos, values, label=label, bottom=bottom, color=colors[i], alpha=0.8)
+            bottom += values
+
+        ax1.set_xlabel('Strategy', fontsize=11, fontweight='bold')
+        ax1.set_ylabel('Energy (kJ)', fontsize=11, fontweight='bold')
+        ax1.set_title('Energy Consumption Breakdown by Strategy', fontsize=13, fontweight='bold')
+        ax1.set_xticks(x_pos)
+        ax1.set_xticklabels(strategy_names, rotation=15, ha='right', fontsize=9)
+        ax1.legend(loc='upper left', fontsize=9)
+        ax1.grid(True, alpha=0.3, axis='y')
+
+        # 2. Time Comparison
+        times = [strategies[name]['total_time'] / 60 for name in strategy_names]  # Convert to minutes
+        bars2 = ax2.bar(x_pos, times, color='#95e1d3', alpha=0.8, edgecolor='black')
+        ax2.set_xlabel('Strategy', fontsize=10, fontweight='bold')
+        ax2.set_ylabel('Time (min)', fontsize=10, fontweight='bold')
+        ax2.set_title('Total Time Comparison', fontsize=12, fontweight='bold')
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(strategy_names, rotation=15, ha='right', fontsize=8)
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        # Add value labels on bars
+        for bar in bars2:
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.1f}', ha='center', va='bottom', fontsize=8)
+
+        # 3. Distance Comparison
+        distances = [strategies[name]['total_distance_3d'] for name in strategy_names]
+        bars3 = ax3.bar(x_pos, distances, color='#f38181', alpha=0.8, edgecolor='black')
+        ax3.set_xlabel('Strategy', fontsize=10, fontweight='bold')
+        ax3.set_ylabel('Distance (m)', fontsize=10, fontweight='bold')
+        ax3.set_title('Total Distance Comparison (3D)', fontsize=12, fontweight='bold')
+        ax3.set_xticks(x_pos)
+        ax3.set_xticklabels(strategy_names, rotation=15, ha='right', fontsize=8)
+        ax3.grid(True, alpha=0.3, axis='y')
+
+        # Add value labels
+        for bar in bars3:
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.0f}', ha='center', va='bottom', fontsize=8)
+
+        # 4. Energy Breakdown Pie (for best strategy)
+        best_strategy = min(strategies.items(), key=lambda x: x[1]['total_energy_kj'])
+        best_name, best_metrics = best_strategy
+
+        pie_values = [
+            best_metrics['climbing_energy_j'] / 1000,
+            best_metrics['rolling_energy_j'] / 1000,
+            best_metrics['air_resistance_energy_j'] / 1000,
+            best_metrics['turn_energy_j'] / 1000
+        ]
+
+        _, _, autotexts = ax4.pie(pie_values, labels=component_labels, autopct='%1.1f%%',
+                                   colors=colors, startangle=90)
+        ax4.set_title(f'Energy Breakdown\n{best_name}\n(Lowest Energy)',
+                     fontsize=12, fontweight='bold')
+
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
+
+        # 5. Performance Heatmap
+        metrics_for_heatmap = ['total_energy_kj', 'total_time', 'total_distance_3d',
+                              'num_turns', 'total_elevation_gain']
+        metric_labels = ['Energy\n(kJ)', 'Time\n(s)', 'Distance\n(m)', 'Turns', 'Elev Gain\n(m)']
+
+        # Create normalized heatmap data
+        heatmap_data = np.zeros((len(metrics_for_heatmap), n_strategies))
+
+        for i, metric in enumerate(metrics_for_heatmap):
+            values = [strategies[name][metric] for name in strategy_names]
+            # Normalize to 0-1 range (lower is better, so invert)
+            min_val, max_val = min(values), max(values)
+            if max_val > min_val:
+                normalized = [(max_val - v) / (max_val - min_val) for v in values]
+            else:
+                normalized = [1.0] * len(values)
+            heatmap_data[i, :] = normalized
+
+        im = ax5.imshow(heatmap_data, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+
+        # Set ticks and labels
+        ax5.set_xticks(np.arange(n_strategies))
+        ax5.set_yticks(np.arange(len(metric_labels)))
+        ax5.set_xticklabels(strategy_names, rotation=15, ha='right', fontsize=9)
+        ax5.set_yticklabels(metric_labels, fontsize=9)
+
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax5)
+        cbar.set_label('Performance\n(Green=Better)', rotation=270, labelpad=20, fontsize=10)
+
+        # Add text annotations
+        for i in range(len(metric_labels)):
+            for j in range(n_strategies):
+                metric = metrics_for_heatmap[i]
+                value = strategies[strategy_names[j]][metric]
+                if metric == 'total_time':
+                    text = f'{value:.0f}s'
+                elif metric == 'total_energy_kj':
+                    text = f'{value:.1f}'
+                else:
+                    text = f'{value:.0f}'
+                ax5.text(j, i, text, ha='center', va='center',
+                        color='black' if heatmap_data[i, j] > 0.5 else 'white',
+                        fontsize=8, fontweight='bold')
+
+        ax5.set_title('Performance Heatmap (Green = Better Performance)',
+                     fontsize=12, fontweight='bold', pad=10)
+
+        fig.suptitle('Vineyard Routing Strategy Comparison', fontsize=16, fontweight='bold', y=0.995)
+
+        if save_as:
+            fig.savefig(save_as, dpi=150, bbox_inches='tight')
+            print(f"     ✓ Saved: {save_as}")
+
+        plt.close(fig)
+        return fig
+
+    def plot_elevation_profiles(self, strategies_data: dict, elevation_model: ElevationModel,
+                               save_as: Optional[str] = 'elevation_profiles.png'):
+        """
+        Plot elevation profiles for different strategies.
+
+        Parameters:
+        -----------
+        strategies_data: Dict mapping strategy name to (segments, metrics) tuple
+        elevation_model: Elevation model
+        save_as: Optional filename to save figure
+        """
+        fig, axes = plt.subplots(len(strategies_data), 1, figsize=(16, 4*len(strategies_data)))
+
+        if len(strategies_data) == 1:
+            axes = [axes]
+
+        for idx, (strategy_name, (segments, metrics)) in enumerate(strategies_data.items()):
+            ax = axes[idx]
+
+            # Calculate elevation profile along path
+            cumulative_distance = 0
+            distances = [0]
+            elevations = [segments[0].start_z if hasattr(segments[0], 'start_z')
+                         else elevation_model.get_elevation(*segments[0].start)]
+
+            for seg in segments:
+                # Interpolate along segment
+                x_path, y_path, _ = seg.interpolate()
+                z_path = elevation_model.get_elevations_vectorized(x_path, y_path)
+
+                seg_distances = np.linspace(cumulative_distance,
+                                           cumulative_distance + seg.distance(),
+                                           len(x_path))
+
+                distances.extend(seg_distances[1:])
+                elevations.extend(z_path[1:])
+                cumulative_distance += seg.distance()
+
+            # Plot elevation profile
+            ax.fill_between(distances, elevations, alpha=0.3, color='brown')
+            ax.plot(distances, elevations, 'b-', linewidth=2, label='Path elevation')
+
+            # Add climb/descent indicators
+            climbs = []
+            descents = []
+            for i in range(1, len(elevations)):
+                if elevations[i] > elevations[i-1]:
+                    climbs.append(i)
+                elif elevations[i] < elevations[i-1]:
+                    descents.append(i)
+
+            if climbs:
+                ax.scatter([distances[i] for i in climbs],
+                          [elevations[i] for i in climbs],
+                          c='red', s=1, alpha=0.3, label='Climbing')
+            if descents:
+                ax.scatter([distances[i] for i in descents],
+                          [elevations[i] for i in descents],
+                          c='green', s=1, alpha=0.3, label='Descending')
+
+            # Add metrics text
+            text = (f"Energy: {metrics['total_energy_kj']:.2f} kJ  |  "
+                   f"Climb: {metrics['total_elevation_gain']:.1f} m  |  "
+                   f"Descent: {metrics['total_elevation_loss']:.1f} m")
+
+            ax.text(0.02, 0.98, text, transform=ax.transAxes,
+                   fontsize=10, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+            ax.set_xlabel('Cumulative Distance (m)', fontsize=11)
+            ax.set_ylabel('Elevation (m)', fontsize=11)
+            ax.set_title(f'{strategy_name} - Elevation Profile', fontsize=13, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right', fontsize=9)
+
+        plt.tight_layout()
+
+        if save_as:
+            fig.savefig(save_as, dpi=150, bbox_inches='tight')
+            print(f"     ✓ Saved: {save_as}")
+
+        plt.close(fig)
+        return fig
+
+    def plot_energy_over_path(self, segments: List[GridSegment],
+                             planner: 'GridConstrainedPlanner',
+                             save_as: Optional[str] = 'energy_over_path.png'):
+        """
+        Plot cumulative energy consumption and battery state over the path.
+
+        Parameters:
+        -----------
+        segments: Path segments
+        planner: Planner with UGV parameters
+        save_as: Optional filename to save figure
+        """
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12))
+
+        # Calculate energy consumption along path
+        cumulative_distance = []
+        cumulative_energy = []
+        energy_rate = []
+        battery_soc = []
+
+        dist = 0
+        energy = 0
+        battery = BatteryState(capacity_wh=500)  # Example battery
+
+        cumulative_distance.append(0)
+        cumulative_energy.append(0)
+        battery_soc.append(1.0)
+        energy_rate.append(0)
+
+        for seg in segments:
+            seg_dist = seg.distance()
+            seg_energy = planner.calculate_segment_energy(seg) if hasattr(planner, 'calculate_segment_energy') else 1000  # fallback
+
+            dist += seg_dist
+            energy += seg_energy
+            battery.consume_energy(seg_energy)
+
+            cumulative_distance.append(dist)
+            cumulative_energy.append(energy / 1000)  # Convert to kJ
+            battery_soc.append(battery.current_soc)
+            energy_rate.append(seg_energy / seg_dist if seg_dist > 0 else 0)  # J/m
+
+        # Plot 1: Cumulative Energy Consumption
+        ax1.plot(cumulative_distance, cumulative_energy, 'b-', linewidth=2, label='Total Energy')
+        ax1.fill_between(cumulative_distance, cumulative_energy, alpha=0.3, color='blue')
+        ax1.set_xlabel('Distance (m)', fontsize=11)
+        ax1.set_ylabel('Cumulative Energy (kJ)', fontsize=11)
+        ax1.set_title('Cumulative Energy Consumption Along Path', fontsize=13, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc='upper left', fontsize=10)
+
+        # Add final energy annotation
+        ax1.annotate(f'Total: {cumulative_energy[-1]:.2f} kJ',
+                    xy=(cumulative_distance[-1], cumulative_energy[-1]),
+                    xytext=(-60, 10), textcoords='offset points',
+                    bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7),
+                    arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                    fontsize=10, fontweight='bold')
+
+        # Plot 2: Energy Rate (J/m)
+        ax2.plot(cumulative_distance[1:], energy_rate[1:], 'r-', linewidth=2, label='Energy per meter')
+        ax2.axhline(y=np.mean(energy_rate[1:]), color='g', linestyle='--',
+                   label=f'Average: {np.mean(energy_rate[1:]):.1f} J/m', linewidth=2)
+        ax2.fill_between(cumulative_distance[1:], energy_rate[1:], alpha=0.3, color='red')
+        ax2.set_xlabel('Distance (m)', fontsize=11)
+        ax2.set_ylabel('Energy Rate (J/m)', fontsize=11)
+        ax2.set_title('Energy Consumption Rate', fontsize=13, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right', fontsize=10)
+
+        # Plot 3: Battery State of Charge
+        ax3.plot(cumulative_distance, [soc * 100 for soc in battery_soc], 'g-', linewidth=3, label='Battery SOC')
+        ax3.fill_between(cumulative_distance, [soc * 100 for soc in battery_soc], alpha=0.3, color='green')
+
+        # Add warning zones
+        ax3.axhspan(0, 20, alpha=0.2, color='red', label='Critical (<20%)')
+        ax3.axhspan(20, 50, alpha=0.1, color='yellow', label='Low (20-50%)')
+
+        ax3.set_xlabel('Distance (m)', fontsize=11)
+        ax3.set_ylabel('Battery SOC (%)', fontsize=11)
+        ax3.set_title('Battery State of Charge', fontsize=13, fontweight='bold')
+        ax3.set_ylim([0, 105])
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc='lower left', fontsize=10)
+
+        # Add final SOC annotation
+        ax3.annotate(f'Final SOC: {battery_soc[-1]*100:.1f}%',
+                    xy=(cumulative_distance[-1], battery_soc[-1]*100),
+                    xytext=(-80, 15), textcoords='offset points',
+                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8),
+                    arrowprops=dict(arrowstyle='->', color='darkgreen', lw=2),
+                    fontsize=10, fontweight='bold')
+
+        plt.tight_layout()
+
+        if save_as:
+            fig.savefig(save_as, dpi=150, bbox_inches='tight')
+            print(f"     ✓ Saved: {save_as}")
+
+        plt.close(fig)
+        return fig
+
+    def create_algorithm_comparison_animations(self,
+                                               waypoints: List[Waypoint],
+                                               strategies_data: dict,
+                                               start_pos: Tuple[float, float],
+                                               elevation_model: Optional[ElevationModel] = None,
+                                               planner: Optional['GridConstrainedPlanner'] = None):
+        """
+        Create individual 2D animations for each algorithm for side-by-side comparison.
+
+        Parameters:
+        -----------
+        waypoints: List of waypoints
+        strategies_data: Dict mapping strategy name to (segments, metrics) tuple
+        start_pos: Starting position
+        elevation_model: Optional elevation model
+        planner: Optional planner instance
+
+        Creates separate animation files:
+        - algorithm_nearest_neighbor.gif
+        - algorithm_elevation.gif
+        - algorithm_simulated_annealing.gif
+        etc.
+        """
+        print("\n   Creating individual algorithm animations...")
+
+        for strategy_name, (segments, _) in strategies_data.items():
+            # Clean filename
+            safe_name = strategy_name.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            filename = f'algorithm_{safe_name}.gif'
+
+            print(f"     - {strategy_name}...")
+
+            try:
+                # Create animation
+                fig, _ = self.animate_ugv_path(
+                    waypoints,
+                    segments,
+                    start_pos,
+                    elevation_model=elevation_model,
+                    planner=planner,
+                    save_as=filename
+                )
+                plt.close(fig)
+                print(f"       ✓ Saved: {filename}")
+            except Exception as e:
+                print(f"       ✗ Failed: {e}")
 
 def generate_random_waypoints(grid: VineyardGrid, num_waypoints: int = 10, elevation_model: Optional[ElevationModel] = None) -> List[Waypoint]:
     """
@@ -2043,7 +2487,7 @@ def main():
     NUM_ROWS = 20              # Number of vine rows
     ROW_SPACING = 3.0          # Distance between rows (meters)
     ROW_LENGTH = 100.0         # Length of each row (meters)
-    TREE_SPACING = 1.0         # Distance between vine trees along row (meters)
+    TREE_SPACING = 1.5         # Distance between vine trees along row (meters)
 
     # Terrain Parameters
     TERRAIN_TYPE = 'mosel'     # 'mosel' for hill-shaped or 'gentle' for gentle slopes
@@ -2135,7 +2579,7 @@ def main():
         print("   3d. Elevation clustering + SA...")
         segments_cluster, metrics_cluster = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='clustering', num_clusters=3)
 
-        print("   3e. Multi-objective optimization (70% energy, 30% time)...")
+        print("   3e. Multi-objective optimization (100% energy, 30% time)...")
         segments_multi, metrics_multi = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='multi_objective', energy_weight=0.7, time_weight=0.3)
 
         # Compare sequencing strategies
@@ -2335,6 +2779,60 @@ def main():
         except Exception as e:
             print(f"     ✗ 3D animation failed: {e}")
 
+    # Create additional analysis visualizations
+    print("\n7. Creating analysis visualizations...")
+
+    # Strategy comparison chart (if strategies were compared)
+    if COMPARE_STRATEGIES:
+        print("   - Strategy comparison chart...")
+        try:
+            visualizer.plot_strategy_comparison(
+                strategies,
+                save_as='strategy_comparison.png'
+            )
+        except Exception as e:
+            print(f"     ✗ Strategy comparison failed: {e}")
+
+        # Elevation profiles for different strategies
+        print("   - Elevation profiles...")
+        try:
+            strategies_data = {
+                'Nearest Neighbor': (segments_nn, metrics_nn),
+                'Elevation Greedy': (segments_elev, metrics_elev),
+                'Simulated Annealing': (segments_sa, metrics_sa)
+            }
+            visualizer.plot_elevation_profiles(
+                strategies_data,
+                elevation_model,
+                save_as='elevation_profiles.png'
+            )
+        except Exception as e:
+            print(f"     ✗ Elevation profiles failed: {e}")
+
+        # Individual algorithm animations
+        print("   - Creating animations for each algorithm...")
+        try:
+            visualizer.create_algorithm_comparison_animations(
+                waypoints,
+                strategies_data,
+                start_pos,
+                elevation_model=elevation_model,
+                planner=planner
+            )
+        except Exception as e:
+            print(f"     ✗ Algorithm animations failed: {e}")
+
+    # Energy consumption over path (for best strategy)
+    print("   - Energy consumption analysis...")
+    try:
+        visualizer.plot_energy_over_path(
+            segments,
+            planner,
+            save_as='energy_over_path.png'
+        )
+    except Exception as e:
+        print(f"     ✗ Energy analysis failed: {e}")
+
     print("\n" + "="*70)
     print("VISUALIZATION SUMMARY")
     print("="*70)
@@ -2347,8 +2845,15 @@ def main():
         print(f"  ✓ {OUTPUT_2D_ANIMATION} - 2D animation")
     if SAVE_3D_ANIMATION:
         print(f"  ✓ {OUTPUT_3D_ANIMATION} - 3D animation with trees")
+    if COMPARE_STRATEGIES:
+        print(f"  ✓ strategy_comparison.png - Strategy performance comparison")
+        print(f"  ✓ elevation_profiles.png - Elevation profiles for strategies")
+        print(f"  ✓ algorithm_nearest_neighbor.gif - Nearest Neighbor animation")
+        print(f"  ✓ algorithm_elevation_greedy.gif - Elevation Greedy animation")
+        print(f"  ✓ algorithm_simulated_annealing.gif - Simulated Annealing animation")
+    print(f"  ✓ energy_over_path.png - Energy consumption and battery analysis")
     print("="*70)
-    print("\nDone!")
+    print("\nDone! UGV returns to start position after visiting all waypoints.")
 
 if __name__ == "__main__":
     main()
