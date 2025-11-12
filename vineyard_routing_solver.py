@@ -1,3 +1,5 @@
+import sys
+import gc
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -111,26 +113,7 @@ class ElevationModel:
         else:
             return self._generate_gentle_terrain()
 
-    def _generate_gentle_terrain(self) -> np.ndarray:
-        """Generate gentle vineyard terrain (original model)"""
-        base_elevation = 100.0  # meters above sea level
-
-        # Linear slope (8% in x, 3% in y)
-        slope_x = 0.08
-        slope_y = 0.03
-
-        linear_elevation = (base_elevation +
-                          slope_x * self.X +
-                          slope_y * self.Y)
-
-        # Add terrain undulations
-        undulation1 = 2.0 * np.sin(0.05 * self.X) * np.cos(0.03 * self.Y)
-        undulation2 = 1.5 * np.sin(0.08 * self.X + np.pi/4) * np.sin(0.06 * self.Y)
-        undulation3 = 0.8 * np.cos(0.1 * self.X) * np.cos(0.1 * self.Y)
-
-        elevation = linear_elevation + undulation1 + undulation2 + undulation3
-
-        return elevation
+  
 
     def _generate_mosel_terrain(self) -> np.ndarray:
         """
@@ -411,7 +394,7 @@ class EnergyAwareOptimizer:
                                 start_pos: Tuple[float, float],
                                 planner: 'GridConstrainedPlanner',
                                 objective: str = 'energy',
-                                max_iterations: int = 10000,
+                                max_iterations: int = 1000,
                                 initial_temp: float = 100.0,
                                 cooling_rate: float = 0.995) -> List[Waypoint]:
         """
@@ -450,6 +433,10 @@ class EnergyAwareOptimizer:
         best_sequence = current_sequence.copy()
         best_cost = current_cost
 
+        # Debug: Print what we're optimizing
+        objective_unit = "J" if objective == "energy" else ("m" if objective == "distance" else "s")
+        print(f"         Optimizing for: {objective} (initial: {current_cost:.2f} {objective_unit})")
+
         temperature = initial_temp
 
         for iteration in range(max_iterations):
@@ -468,6 +455,10 @@ class EnergyAwareOptimizer:
                 new_sequence, start_pos, planner, objective
             )
 
+            # Check for invalid cost (inf means calculation failed)
+            if new_cost == float('inf'):
+                continue
+
             # Acceptance probability
             cost_diff = new_cost - current_cost
 
@@ -483,6 +474,15 @@ class EnergyAwareOptimizer:
             # Cool down
             temperature *= cooling_rate
 
+            # Periodic garbage collection to prevent memory buildup (more frequent)
+            if iteration % 5 == 0:
+                gc.collect()
+
+        gc.collect()  # Final cleanup
+
+        # Debug: Print final best cost
+        print(f"         Final best {objective}: {best_cost:.2f} {objective_unit}")
+
         return best_sequence
 
     @staticmethod
@@ -491,18 +491,23 @@ class EnergyAwareOptimizer:
                                  planner: 'GridConstrainedPlanner',
                                  objective: str = 'energy') -> float:
         """Calculate cost (energy, distance, or time) for a waypoint sequence"""
-        segments, metrics = planner.plan_complete_tour(
-            sequence, start_pos, sequencing_mode='custom', custom_sequence=sequence
-        )
+        try:
+            _, metrics, _ = planner.plan_complete_tour(
+                sequence, start_pos, sequencing_mode='custom', custom_sequence=sequence
+            )
 
-        if objective == 'energy':
-            return metrics['total_energy_j']
-        elif objective == 'distance':
-            return metrics['total_distance']
-        elif objective == 'time':
-            return metrics['total_time']
-        else:
-            return metrics['total_energy_j']
+            if objective == 'energy':
+                return metrics['total_energy_j']
+            elif objective == 'distance':
+                return metrics['total_distance']
+            elif objective == 'time':
+                return metrics['total_time']
+            else:
+                return metrics['total_energy_j']
+        except Exception as e:
+            # If calculation fails, return a large penalty
+            print(f"Warning: Cost calculation failed: {e}")
+            return float('inf')
 
     @staticmethod
     def two_opt_improve(waypoints: List[Waypoint],
@@ -586,7 +591,7 @@ class EnergyAwareOptimizer:
         baseline_seq = planner.sequence_waypoints(
             waypoints, start_pos, mode='nearest_neighbor'
         )
-        _, baseline_metrics = planner.plan_complete_tour(
+        _, baseline_metrics, _ = planner.plan_complete_tour(
             baseline_seq, start_pos, sequencing_mode='custom',
             custom_sequence=baseline_seq
         )
@@ -606,7 +611,7 @@ class EnergyAwareOptimizer:
 
         # Weighted objective function (now uses cached baseline)
         def weighted_cost(sequence):
-            segments, metrics = planner.plan_complete_tour(
+            segments, metrics, _ = planner.plan_complete_tour(
                 sequence, start_pos, sequencing_mode='custom',
                 custom_sequence=sequence
             )
@@ -688,7 +693,7 @@ class EnergyAwareOptimizer:
             sequence = [waypoints[i] for i in indices]
 
             # Calculate cost
-            segments, metrics = planner.plan_complete_tour(
+            segments, metrics, _ = planner.plan_complete_tour(
                 sequence, start_pos, sequencing_mode='custom',
                 custom_sequence=sequence
             )
@@ -810,16 +815,25 @@ class WaypointSequencingEnv(gym.Env):
         self.steps += 1
 
         # Reward is negative cost (we want to minimize)
-        reward = -step_cost / 1000.0  # Normalize
+        # Scale reward to reasonable range
+        reward = -step_cost / 10000.0  # Normalize
 
         # Check if done
         terminated = np.all(self.visited)
 
-        # Bonus for completing tour efficiently
+        # Reward structure to ensure all waypoints are visited
         if terminated:
-            # Normalize by number of waypoints
-            efficiency_bonus = (self.n_waypoints * 1000.0 - self.total_cost) / 10000.0
-            reward += efficiency_bonus
+            # Large bonus ONLY if all waypoints visited
+            completion_bonus = 100.0  # Large positive reward for completing the tour
+            # Penalty for total cost
+            cost_penalty = self.total_cost / 10000.0
+            reward = completion_bonus - cost_penalty
+        else:
+            # Small step reward to encourage progress
+            if self.visited is not None:
+                remaining_waypoints = int(np.sum(~self.visited))
+                progress_reward = 1.0 / (remaining_waypoints + 1)
+                reward += progress_reward
 
         obs = self._get_observation()
         return obs, reward, terminated, False, {}
@@ -837,7 +851,7 @@ class RLOptimizer:
                       planner: 'GridConstrainedPlanner',
                       objective: str = 'energy',
                       algorithm: str = 'PPO',
-                      total_timesteps: int = 10000) -> List[Waypoint]:
+                      total_timesteps: int = 1000) -> List[Waypoint]:
         """
         Train an RL agent to optimize waypoint sequencing.
 
@@ -874,8 +888,9 @@ class RLOptimizer:
         else:  # SAC (for continuous but we adapt)
             model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.0003)
 
-        # Train the agent
+        # Train the agent (with periodic GC to prevent memory issues)
         model.learn(total_timesteps=total_timesteps)
+        gc.collect()  # Clean up training memory
 
         # Generate optimized sequence
         obs, _ = env.reset()
@@ -938,20 +953,7 @@ class GridConstrainedPlanner:
             return EnergyAwareOptimizer.simulated_annealing_tsp(
                 waypoints, start_pos, self, objective, max_iterations
             )
-        elif mode == 'clustering':
-            num_clusters = kwargs.get('num_clusters', 3)
-            clusters = EnergyAwareOptimizer.cluster_by_elevation(
-                waypoints, num_clusters, self.elevation
-            )
-            # Sequence within each cluster and combine
-            sequence = []
-            for cluster in clusters:
-                cluster_seq = EnergyAwareOptimizer.simulated_annealing_tsp(
-                    cluster, start_pos, self, objective='energy',
-                    max_iterations=500
-                )
-                sequence.extend(cluster_seq)
-            return sequence
+          
         elif mode == 'two_opt':
             # Start with nearest neighbor and improve
             initial_seq = self._sequence_by_nearest_neighbor(waypoints, start_pos)
@@ -1162,7 +1164,7 @@ class GridConstrainedPlanner:
     def plan_complete_tour(self, waypoints: List[Waypoint],
                           start_pos: Tuple[float, float],
                           sequencing_mode: str = 'elevation',
-                          **kwargs) -> Tuple[List[GridSegment], dict]:
+                          **kwargs) -> Tuple[List[GridSegment], dict, List[Waypoint]]:
         """
         Plan complete tour visiting all waypoints in alleys between rows
 
@@ -1175,7 +1177,7 @@ class GridConstrainedPlanner:
 
         Returns:
         --------
-        Tuple of (segments, metrics)
+        Tuple of (segments, metrics, sequenced_waypoints)
         """
         # Phase 1: Sequence waypoints
         sequence = self.sequence_waypoints(waypoints, start_pos, mode=sequencing_mode, **kwargs)
@@ -1206,7 +1208,7 @@ class GridConstrainedPlanner:
         # Calculate metrics
         metrics = self.calculate_metrics(all_segments)
 
-        return all_segments, metrics
+        return all_segments, metrics, sequence
     
     def calculate_energy_for_segment(self, seg: GridSegment) -> dict:
         """
@@ -1462,11 +1464,16 @@ class VineyardVisualizer:
                        0, self.grid.get_row_y(self.grid.num_rows-1),
                        alpha=0.1, color='gray')
     
-    def _plot_waypoints(self, ax, waypoints):
-        """Plot waypoint locations"""
+    def _plot_waypoints(self, ax, waypoints, waypoint_visit_order=None):
+        """Plot waypoint locations with optional visit order labels"""
         for i, wp in enumerate(waypoints):
             ax.plot(wp.x, wp.y, 'ro', markersize=8, label='Waypoints' if i == 0 else '')
-            ax.text(wp.x + 1, wp.y + 0.5, f'W{i+1}', fontsize=8)
+            # Use visit order if available, otherwise use original index
+            if waypoint_visit_order and (wp.x, wp.y, wp.row_id) in waypoint_visit_order:
+                label_num = waypoint_visit_order[(wp.x, wp.y, wp.row_id)]
+            else:
+                label_num = i + 1
+            ax.text(wp.x + 1, wp.y + 0.5, f'W{label_num}', fontsize=8)
     
     def _plot_path(self, ax, segments, show_interpolated=True):
         """Plot the planned path with optional interpolated waypoints"""
@@ -1565,18 +1572,20 @@ class VineyardVisualizer:
                         start_pos: Tuple[float, float],
                         elevation_model: Optional[ElevationModel] = None,
                         planner: Optional['GridConstrainedPlanner'] = None,
-                        save_as: Optional[str] = None):
+                        save_as: Optional[str] = None,
+                        sequenced_waypoints: Optional[List[Waypoint]] = None):
         """
         Create animation of UGV traveling along the planned path
 
         Parameters:
         -----------
-        waypoints: List of waypoints to visit
+        waypoints: List of waypoints to visit (original unordered list)
         segments: Path segments to follow
         start_pos: Starting position
         elevation_model: Optional elevation model for terrain visualization
         planner: Optional planner for UGV parameters (mass, velocity, etc.)
         save_as: Optional filename to save animation (e.g., 'ugv_animation.gif')
+        sequenced_waypoints: Optional list of waypoints in visit order (for labeling)
         """
         # Default UGV parameters if planner not provided
         if planner is None:
@@ -1584,23 +1593,30 @@ class VineyardVisualizer:
             ugv_g = 9.81
             rolling_resistance = 0.15
             mechanical_efficiency = 0.75
-            air_resistance_coeff = 0.5
             velocity = 1.5
         else:
             ugv_mass = planner.ugv_mass
             ugv_g = planner.g
             rolling_resistance = planner.rolling_resistance
             mechanical_efficiency = planner.mechanical_efficiency
-            air_resistance_coeff = planner.air_resistance_coeff
             velocity = planner.velocity
-        # Create figure with 2 subplots (2D path and elevation profile)
-        fig = plt.figure(figsize=(16, 7))
-        ax1 = plt.subplot(1, 2, 1)  # 2D top view
-        ax2 = plt.subplot(1, 2, 2)  # Elevation profile
+        # Create waypoint visit order mapping
+        waypoint_visit_order = {}
+        if sequenced_waypoints is not None:
+            for visit_order, wp in enumerate(sequenced_waypoints, start=1):
+                # Create a unique key for each waypoint based on position
+                waypoint_visit_order[(wp.x, wp.y, wp.row_id)] = visit_order
+
+        # Create figure with 4 subplots (2D path, elevation, energy, distance)
+        fig = plt.figure(figsize=(24, 12))
+        ax1 = plt.subplot(2, 2, 1)  # 2D top view
+        ax2 = plt.subplot(2, 2, 2)  # Elevation profile
+        ax3 = plt.subplot(2, 2, 3)  # Energy profile
+        ax4 = plt.subplot(2, 2, 4)  # Distance profile
 
         # Plot static vineyard structure on ax1
         self._plot_vineyard_structure(ax1)
-        self._plot_waypoints(ax1, waypoints)
+        self._plot_waypoints(ax1, waypoints, waypoint_visit_order)
         self._plot_path(ax1, segments)
 
         ax1.set_xlabel('Distance along row (m) - Upslope Direction')
@@ -1662,6 +1678,24 @@ class VineyardVisualizer:
             path_distances = None
             path_elevations = None
 
+        # Setup Energy Profile (ax3) - will be populated during animation
+        ax3.set_xlabel('Distance along path (m)')
+        ax3.set_ylabel('Cumulative Energy (kJ)')
+        ax3.set_title('Energy Consumption Profile')
+        ax3.grid(True, alpha=0.3)
+        energy_line, = ax3.plot([], [], 'r-', linewidth=2, label='Energy')
+        energy_marker, = ax3.plot([], [], 'ro', markersize=10, markeredgecolor='darkred', markeredgewidth=2)
+        ax3.legend(loc='upper left')
+
+        # Setup Distance Profile (ax4) - will show cumulative distance over time
+        ax4.set_xlabel('Time (frames)')
+        ax4.set_ylabel('Cumulative Distance (m)')
+        ax4.set_title('Distance Traveled Profile')
+        ax4.grid(True, alpha=0.3)
+        distance_line, = ax4.plot([], [], 'g-', linewidth=2, label='Distance')
+        distance_marker, = ax4.plot([], [], 'go', markersize=10, markeredgecolor='darkgreen', markeredgewidth=2)
+        ax4.legend(loc='upper left')
+
         # Build interpolated path points for smooth animation (optimized)
         path_points = []
         path_point_distances = []
@@ -1698,10 +1732,8 @@ class VineyardVisualizer:
                     potential_energy = max(0, ugv_mass * ugv_g * dz)
                     # Rolling resistance
                     rolling_energy = ugv_mass * ugv_g * rolling_resistance * dist_3d
-                    # Air resistance
-                    air_energy = 0.5 * air_resistance_coeff * (velocity ** 2) * dist_3d
-                    # Total mechanical energy with efficiency
-                    segment_energy = (potential_energy + rolling_energy + air_energy) / mechanical_efficiency
+                    # Total mechanical energy with efficiency (air resistance removed)
+                    segment_energy = (potential_energy + rolling_energy) / mechanical_efficiency
 
                     cumulative_energy += segment_energy
 
@@ -1737,7 +1769,25 @@ class VineyardVisualizer:
                     elev = np.interp(dist, path_distances, path_elevations)
                     elev_marker.set_data([dist], [elev])
 
-            return ugv, ugv_trail, metrics_text, elev_marker if elev_marker else ugv
+                # Update energy profile (ax3)
+                current_distances = path_point_distances[:frame+1]
+                current_energies = [e/1000 for e in path_point_energies[:frame+1]]  # Convert to kJ
+                energy_line.set_data(current_distances, current_energies)
+                energy_marker.set_data([dist_traveled], [energy_used/1000])
+                ax3.set_xlim(0, max(path_point_distances) if path_point_distances else 1)
+                ax3.set_ylim(0, max(current_energies) * 1.1 if current_energies else 1)
+
+                # Update distance profile (ax4)
+                frames_so_far = list(range(frame+1))
+                distance_line.set_data(frames_so_far, current_distances)
+                distance_marker.set_data([frame], [dist_traveled])
+                ax4.set_xlim(0, len(path_points))
+                ax4.set_ylim(0, max(path_point_distances) * 1.1 if path_point_distances else 1)
+
+            artists = [ugv, ugv_trail, metrics_text, energy_line, energy_marker, distance_line, distance_marker]
+            if elev_marker:
+                artists.append(elev_marker)
+            return artists
 
         # Create animation (optimized with faster frame rate)
         anim = FuncAnimation(fig, animate, frames=len(path_points),
@@ -1746,10 +1796,11 @@ class VineyardVisualizer:
         # Save if requested
         if save_as:
             print(f"Saving animation to {save_as}...")
-            # Faster frame rate and reduced DPI for faster saving
-            writer = PillowWriter(fps=30)
-            anim.save(save_as, writer=writer, dpi=80)
+            # Faster frame rate and reduced DPI for faster saving and less memory
+            writer = PillowWriter(fps=20)
+            anim.save(save_as, writer=writer, dpi=60)
             print(f"Animation saved!")
+            gc.collect()  # Clean up after saving
 
         plt.tight_layout()
         return fig, anim
@@ -1758,22 +1809,30 @@ class VineyardVisualizer:
                        segments: List[GridSegment],
                        start_pos: Tuple[float, float],
                        elevation_model: ElevationModel,
-                       save_as: Optional[str] = 'vineyard_3d_terrain.png'):
+                       save_as: Optional[str] = 'vineyard_3d_terrain.png',
+                       sequenced_waypoints: Optional[List[Waypoint]] = None):
         """
         Create 3D visualization of terrain with UGV path
 
         Parameters:
         -----------
-        waypoints: List of waypoints to visit
+        waypoints: List of waypoints to visit (original unordered list)
         segments: Path segments to follow
         start_pos: Starting position
         elevation_model: Elevation model for terrain surface
         save_as: Optional filename to save figure
+        sequenced_waypoints: Optional list of waypoints in visit order (for labeling)
         """
         fig = plt.figure(figsize=(16, 12))
 
         # Create 3D subplot
         ax = fig.add_subplot(111, projection='3d')
+
+        # Create waypoint visit order mapping
+        waypoint_visit_order = {}
+        if sequenced_waypoints is not None:
+            for visit_order, wp in enumerate(sequenced_waypoints, start=1):
+                waypoint_visit_order[(wp.x, wp.y, wp.row_id)] = visit_order
 
         # Plot terrain surface
         surf = ax.plot_surface(elevation_model.X, elevation_model.Y,
@@ -1811,11 +1870,20 @@ class VineyardVisualizer:
             z_vals = elevation_model.get_elevations_vectorized(x_vals, y_headland)
             ax.plot(x_vals, y_headland, z_vals, 'k-', alpha=0.5, linewidth=2)
 
-        # Plot waypoints in 3D
+        # Plot waypoints in 3D with numbers
         for i, wp in enumerate(waypoints):
             ax.scatter(wp.x, wp.y, wp.z, c='red', s=100, marker='o',
                       edgecolors='darkred', linewidth=2, zorder=5)
-            ax.text(wp.x, wp.y, wp.z + 0.5, f'W{i+1}', fontsize=8, zorder=5)
+            # Use visit order if available, otherwise use original index
+            if waypoint_visit_order and (wp.x, wp.y, wp.row_id) in waypoint_visit_order:
+                label_num = waypoint_visit_order[(wp.x, wp.y, wp.row_id)]
+            else:
+                label_num = i + 1
+            # Add waypoint number label with better styling
+            ax.text(wp.x, wp.y, wp.z + 2, f'{label_num}', fontsize=9,
+                   color='white', weight='bold', ha='center', va='bottom',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='red',
+                           edgecolor='darkred', alpha=0.8), zorder=6)
 
         # Plot start position
         z_start = elevation_model.get_elevation(start_pos[0], start_pos[1])
@@ -1853,8 +1921,8 @@ class VineyardVisualizer:
         ax.set_zlabel('Elevation (m ASL)', fontsize=10, labelpad=10)
         ax.set_title('Mosel Valley 3D Terrain with UGV Path', fontsize=14, fontweight='bold', pad=20)
 
-        # Set viewing angle (60 degree rotation for better perspective)
-        ax.view_init(elev=25, azim=60)
+        # Set viewing angle - rotated 60 degrees from side view for better perspective
+        ax.view_init(elev=30, azim=120)
 
         # Add legend
         ax.legend(loc='upper left', fontsize=9)
@@ -1876,7 +1944,8 @@ class VineyardVisualizer:
                        segments: List[GridSegment],
                        start_pos: Tuple[float, float],
                        elevation_model: ElevationModel,
-                       save_as: Optional[str] = None):
+                       save_as: Optional[str] = None,
+                       sequenced_waypoints: Optional[List[Waypoint]] = None):
         """
         Create 3D animation of UGV traveling on terrain
 
@@ -1890,6 +1959,12 @@ class VineyardVisualizer:
         """
         fig = plt.figure(figsize=(14, 10))
         ax = fig.add_subplot(111, projection='3d')
+
+        # Create waypoint visit order mapping
+        waypoint_visit_order = {}
+        if sequenced_waypoints is not None:
+            for visit_order, wp in enumerate(sequenced_waypoints, start=1):
+                waypoint_visit_order[(wp.x, wp.y, wp.row_id)] = visit_order
 
         # Plot static terrain
         surf = ax.plot_surface(elevation_model.X, elevation_model.Y,
@@ -1905,10 +1980,20 @@ class VineyardVisualizer:
             ax.scatter(tree_x, tree_y, tree_z, c='darkgreen', s=8,
                       marker='o', alpha=0.3, zorder=2)
 
-        # Plot waypoints (larger and more visible)
+        # Plot waypoints (larger and more visible) with numbers
         for i, wp in enumerate(waypoints):
             ax.scatter(wp.x, wp.y, wp.z, c='red', s=80, marker='o',
                       edgecolors='darkred', linewidth=1.5, zorder=5)
+            # Use visit order if available, otherwise use original index
+            if waypoint_visit_order and (wp.x, wp.y, wp.row_id) in waypoint_visit_order:
+                label_num = waypoint_visit_order[(wp.x, wp.y, wp.row_id)]
+            else:
+                label_num = i + 1
+            # Add waypoint number label
+            ax.text(wp.x, wp.y, wp.z + 2, f'{label_num}', fontsize=9,
+                   color='white', weight='bold', ha='center', va='bottom',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='red',
+                           edgecolor='darkred', alpha=0.8), zorder=6)
 
         # Plot path with intermediate waypoints (optimized)
         for seg in segments:
@@ -1984,10 +2069,11 @@ class VineyardVisualizer:
         # Save if requested
         if save_as:
             print(f"Saving 3D animation to {save_as}...")
-            # Faster frame rate and reduced DPI for faster saving
-            writer = PillowWriter(fps=30)
-            anim.save(save_as, writer=writer, dpi=80)
+            # Faster frame rate and reduced DPI for faster saving and less memory
+            writer = PillowWriter(fps=20)
+            anim.save(save_as, writer=writer, dpi=60)
             print(f"3D animation saved!")
+            gc.collect()  # Clean up after saving
 
         plt.tight_layout()
         return fig, anim
@@ -2181,8 +2267,14 @@ class VineyardVisualizer:
                 elevations.extend(z_path[1:])
                 cumulative_distance += seg.distance()
 
-            # Plot elevation profile
-            ax.fill_between(distances, elevations, alpha=0.3, color='brown')
+            # Plot elevation profile with base elevation fill
+            # Get base elevation from the terrain minimum
+            if elevation_model:
+                base_elev = float(np.min(elevation_model.elevation))
+            else:
+                base_elev = 150.0  # Default Mosel Valley base elevation
+
+            ax.fill_between(distances, base_elev, elevations, alpha=0.3, color='brown')
             ax.plot(distances, elevations, 'b-', linewidth=2, label='Path elevation')
 
             # Add climb/descent indicators
@@ -2217,6 +2309,9 @@ class VineyardVisualizer:
             ax.set_title(f'{strategy_name} - Elevation Profile', fontsize=13, fontweight='bold')
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right', fontsize=9)
+
+            # Set y-axis to start from base elevation
+            ax.set_ylim(bottom=base_elev)
 
         plt.tight_layout()
 
@@ -2260,6 +2355,10 @@ class VineyardVisualizer:
         cumulative_energy.append(0)
         energy_rate.append(0)
 
+        # Store segment boundaries for step plot
+        segment_boundaries = [0]  # Start position
+        segment_rates = []  # Energy rate for each segment (constant per segment)
+
         for seg in segments:
             seg_dist = seg.distance()
             energy_data = planner.calculate_energy_for_segment(seg)
@@ -2270,7 +2369,11 @@ class VineyardVisualizer:
 
             cumulative_distance.append(dist)
             cumulative_energy.append(energy / 1000)  # Convert to kJ
-            energy_rate.append(seg_energy / seg_dist if seg_dist > 0 else 0)  # J/m
+
+            # Calculate constant energy rate for this segment
+            seg_rate = seg_energy / seg_dist if seg_dist > 0 else 0
+            segment_rates.append(seg_rate)
+            segment_boundaries.append(dist)
 
             # Track elevation at end of segment
             if seg.elevation_end is not None:
@@ -2295,20 +2398,34 @@ class VineyardVisualizer:
                     arrowprops=dict(arrowstyle='->', color='red', lw=2),
                     fontsize=10, fontweight='bold')
 
-        # Plot 2: Energy Rate (J/m)
-        ax2.plot(cumulative_distance[1:], energy_rate[1:], 'r-', linewidth=2, label='Energy per meter')
-        ax2.axhline(y=np.mean(energy_rate[1:]), color='g', linestyle='--',
-                   label=f'Average: {np.mean(energy_rate[1:]):.1f} J/m', linewidth=2)
-        ax2.fill_between(cumulative_distance[1:], energy_rate[1:], alpha=0.3, color='red')
+        # Plot 2: Energy Rate (J/m) - Step plot with constant rate per segment
+        for i in range(len(segment_rates)):
+            ax2.hlines(segment_rates[i], segment_boundaries[i], segment_boundaries[i+1],
+                      colors='r', linewidth=2, label='Energy per meter' if i == 0 else '')
+            # Add vertical lines to show segment transitions
+            if i < len(segment_rates) - 1:
+                ax2.vlines(segment_boundaries[i+1], segment_rates[i], segment_rates[i+1],
+                          colors='r', linewidth=2, linestyles='--', alpha=0.3)
+
+        ax2.axhline(y=np.mean(segment_rates), color='g', linestyle='--',
+                   label=f'Average: {np.mean(segment_rates):.1f} J/m', linewidth=2)
         ax2.set_xlabel('Distance (m)', fontsize=11)
         ax2.set_ylabel('Energy Rate (J/m)', fontsize=11)
-        ax2.set_title('Energy Consumption Rate', fontsize=13, fontweight='bold')
+        ax2.set_title('Energy Consumption Rate (Constant per Segment)', fontsize=13, fontweight='bold')
         ax2.grid(True, alpha=0.3)
         ax2.legend(loc='upper right', fontsize=10)
 
         # Plot 3: Elevation Profile
+        # Get base elevation for fill (use minimum elevation as base)
+        # For Mosel Valley, base is 150m; for gentle terrain, base is 100m
+        if hasattr(planner, 'elevation_model'):
+            # Use the minimum elevation from the terrain as base
+            base_elev = float(np.min(planner.elevation_model.elevation))
+        else:
+            base_elev = 150.0  # Default Mosel Valley base elevation
+
         ax3.plot(cumulative_distance, elevations, 'brown', linewidth=2, label='Elevation')
-        ax3.fill_between(cumulative_distance, elevations, alpha=0.3, color='brown')
+        ax3.fill_between(cumulative_distance, base_elev, elevations, alpha=0.3, color='brown')
 
         # Mark climbing and descending sections
         for i in range(1, len(elevations)):
@@ -2326,6 +2443,9 @@ class VineyardVisualizer:
         ax3.set_title('Elevation Profile Along Path', fontsize=13, fontweight='bold')
         ax3.grid(True, alpha=0.3)
         ax3.legend(loc='upper right', fontsize=10)
+
+        # Set y-axis to start from base elevation
+        ax3.set_ylim(bottom=base_elev)
 
         # Add elevation change annotation
         total_gain = sum(max(0, elevations[i] - elevations[i-1]) for i in range(1, len(elevations)))
@@ -2448,15 +2568,16 @@ def main():
     MAX_ELEVATION_GAIN = 30.0  # Maximum elevation gain along row (configured in ElevationModel)
 
     # Waypoint Generation
-    NUM_WAYPOINTS = 10         # Number of random waypoints to generate
+    NUM_WAYPOINTS = 15         # Number of random waypoints to generate
 
     # UGV Parameters (defined in GridConstrainedPlanner, listed here for reference)
     # UGV_MASS = 150.0         # kg (typical agricultural UGV)
     # UGV_VELOCITY = 1.5       # m/s (average travel velocity)
     # ROLLING_RESISTANCE = 0.15  # coefficient for rough terrain
     # MECHANICAL_EFFICIENCY = 0.75  # motor/drivetrain efficiency (0-1)
-    # AIR_RESISTANCE_COEFF = 0.5    # Cd * A (drag coefficient * frontal area)
+ 
     # TURN_TIME = 6.0          # seconds per 90° turn
+    RUN_RL_OPTIMIZER = False  # Set to True to enable PPO training
 
     # Sequencing Strategy
     COMPARE_STRATEGIES = True  # Compare both sequencing strategies
@@ -2465,8 +2586,9 @@ def main():
     # Visualization Parameters
     SAVE_2D_PLOT = True        # Save 2D static visualization
     SAVE_3D_PLOT = True        # Save 3D terrain visualization
-    SAVE_2D_ANIMATION = True   # Save 2D animation (GIF)
-    SAVE_3D_ANIMATION = True   # Save 3D animation (GIF)
+    SAVE_2D_ANIMATION = False   # Save 2D animation (GIF)
+    SAVE_3D_ANIMATION = False   # Save 3D animation (GIF)
+    SAVE_ALGORITHM_ANIMATIONS = False  # Save individual algorithm animations (GIF)
 
     # Output File Names
     OUTPUT_2D_PLOT = 'vineyard_solution.png'
@@ -2520,29 +2642,58 @@ def main():
 
     if COMPARE_STRATEGIES:
         print("\n   3a. Nearest Neighbor sequencing (baseline)...")
-        segments_nn, metrics_nn = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='nearest_neighbor')
+        segments_nn, metrics_nn, seq_nn = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='nearest_neighbor')
 
         print("   3b. Elevation-based greedy sequencing...")
-        segments_elev, metrics_elev = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='elevation')
+        segments_elev, metrics_elev, seq_elev = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='elevation')
 
-        print("   3c. Simulated Annealing (scipy-based energy optimization)...")
-        segments_sa, metrics_sa = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=1000)
+        print("   3c. Simulated Annealing (energy optimization with 2000 iterations)...")
+        sys.stdout.flush()
+        # Using reduced iterations with periodic garbage collection to prevent segfault
+        segments_sa_energy, metrics_sa_energy, seq_sa_energy = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=2000)
+        print("      ✓ SA (energy) completed")
+        gc.collect()  # Clean up after SA
+        import time
+        time.sleep(0.5)  # Brief pause to allow memory cleanup
+        gc.collect()  # Second cleanup
 
-        print("   3d. RL Optimizer (PPO algorithm)...")
-        segments_rl, metrics_rl = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='rl', objective='energy')
+        print("   3d. Simulated Annealing (distance optimization with 2000 iterations)...")
+        sys.stdout.flush()
+        segments_sa_dist, metrics_sa_dist, seq_sa_dist = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='distance', max_iterations=2000)
+        print("      ✓ SA (distance) completed")
+        gc.collect()  # Clean up after SA
+
+        # RL Optimizer (optional - can cause memory issues)
+        if RUN_RL_OPTIMIZER:
+            print("   3e. RL Optimizer (PPO algorithm)...")
+            sys.stdout.flush()
+            try:
+                segments_rl, metrics_rl, seq_rl = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='rl', objective='energy', timesteps=50000)
+                print("      ✓ PPO completed")
+                gc.collect()  # Clean up after PPO
+            except Exception as e:
+                print(f"      ⚠ PPO training failed: {e}")
+                print(f"      Using SA energy result as fallback...")
+                segments_rl, metrics_rl, seq_rl = segments_sa_energy, metrics_sa_energy, seq_sa_energy
+        else:
+            print("   3e. RL Optimizer (DISABLED - set RUN_RL_OPTIMIZER=True to enable)")
 
         # Compare sequencing strategies
+        num_strategies = 5 if RUN_RL_OPTIMIZER else 4
         print("\n" + "="*70)
-        print("SEQUENCING STRATEGY COMPARISON (4 STRATEGIES)")
+        print(f"SEQUENCING STRATEGY COMPARISON ({num_strategies} STRATEGIES)")
         print("="*70)
 
         # Create comparison table
         strategies = {
             'Nearest Neighbor': metrics_nn,
             'Elevation Greedy': metrics_elev,
-            'Simulated Annealing (Scipy)': metrics_sa,
-            'RL (PPO)': metrics_rl
+            'Simulated Annealing (Energy)': metrics_sa_energy,
+            'Simulated Annealing (Distance)': metrics_sa_dist
         }
+
+        if RUN_RL_OPTIMIZER:
+            strategies['RL (PPO)'] = metrics_rl
 
         print("\n{:<30} {:>12} {:>12} {:>12}".format(
             "Strategy", "Energy (kJ)", "Time (min)", "Distance (m)"
@@ -2585,24 +2736,61 @@ def main():
             print(f"  Energy: {energy_save:+.1f}%")
             print(f"  Time: {time_diff:+.1f}%")
 
-        # Use best energy strategy for visualization
-        better_strategy = best_energy[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
-        if 'simulated' in better_strategy or 'scipy' in better_strategy:
-            segments = segments_sa
-            metrics = metrics_sa
-        elif 'rl' in better_strategy or 'ppo' in better_strategy:
-            segments = segments_rl
-            metrics = metrics_rl
-        elif 'elevation' in better_strategy:
-            segments = segments_elev
-            metrics = metrics_elev
+        # Select segments/waypoints for best energy strategy
+        best_energy_name = best_energy[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
+        if 'energy' in best_energy_name and 'simulated' in best_energy_name:
+            segments_energy = segments_sa_energy
+            metrics_energy = metrics_sa_energy
+            seq_energy = seq_sa_energy
+        elif 'distance' in best_energy_name and 'simulated' in best_energy_name:
+            segments_energy = segments_sa_dist
+            metrics_energy = metrics_sa_dist
+            seq_energy = seq_sa_dist
+        elif 'rl' in best_energy_name or 'ppo' in best_energy_name:
+            segments_energy = segments_rl
+            metrics_energy = metrics_rl
+            seq_energy = seq_rl
+        elif 'elevation' in best_energy_name:
+            segments_energy = segments_elev
+            metrics_energy = metrics_elev
+            seq_energy = seq_elev
         else:
-            segments = segments_nn
-            metrics = metrics_nn
+            segments_energy = segments_nn
+            metrics_energy = metrics_nn
+            seq_energy = seq_nn
+
+        # Select segments/waypoints for best distance strategy
+        best_distance_name = best_distance[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
+        if 'energy' in best_distance_name and 'simulated' in best_distance_name:
+            segments_distance = segments_sa_energy
+            metrics_distance = metrics_sa_energy
+            seq_distance = seq_sa_energy
+        elif 'distance' in best_distance_name and 'simulated' in best_distance_name:
+            segments_distance = segments_sa_dist
+            metrics_distance = metrics_sa_dist
+            seq_distance = seq_sa_dist
+        elif 'rl' in best_distance_name or 'ppo' in best_distance_name:
+            segments_distance = segments_rl
+            metrics_distance = metrics_rl
+            seq_distance = seq_rl
+        elif 'elevation' in best_distance_name:
+            segments_distance = segments_elev
+            metrics_distance = metrics_elev
+            seq_distance = seq_elev
+        else:
+            segments_distance = segments_nn
+            metrics_distance = metrics_nn
+            seq_distance = seq_nn
+
+        # Use best energy strategy as default visualization
+        segments = segments_energy
+        metrics = metrics_energy
+        sequenced_waypoints = seq_energy
+        better_strategy = best_energy_name
     else:
         # Use default strategy without comparison
         print(f"\n   Using {DEFAULT_STRATEGY} strategy...")
-        segments, metrics = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode=DEFAULT_STRATEGY)
+        segments, metrics, sequenced_waypoints = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode=DEFAULT_STRATEGY)
         better_strategy = DEFAULT_STRATEGY
 
     # Print metrics for selected strategy
@@ -2683,7 +2871,8 @@ def main():
                 segments,
                 start_pos,
                 elevation_model,
-                save_as=OUTPUT_3D_PLOT
+                save_as=OUTPUT_3D_PLOT,
+                sequenced_waypoints=sequenced_waypoints
             )
         except Exception as e:
             print(f"     ✗ 3D terrain visualization failed: {e}")
@@ -2699,12 +2888,16 @@ def main():
                 start_pos,
                 elevation_model=elevation_model,
                 planner=planner,
-                save_as=OUTPUT_2D_ANIMATION
+                save_as=OUTPUT_2D_ANIMATION,
+                sequenced_waypoints=sequenced_waypoints
             )
             plt.close(fig_anim_2d)
+            gc.collect()  # Clean up after 2D animation
             print(f"     ✓ 2D animation saved as: {OUTPUT_2D_ANIMATION}")
         except Exception as e:
             print(f"     ✗ 2D animation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Create 3D animation
     if SAVE_3D_ANIMATION:
@@ -2716,9 +2909,11 @@ def main():
                 segments,
                 start_pos,
                 elevation_model,
-                save_as=OUTPUT_3D_ANIMATION
+                save_as=OUTPUT_3D_ANIMATION,
+                sequenced_waypoints=sequenced_waypoints
             )
             plt.close(fig_anim_3d)
+            gc.collect()  # Clean up after 3D animation
             print(f"     ✓ 3D animation saved as: {OUTPUT_3D_ANIMATION}")
         except Exception as e:
             print(f"     ✗ 3D animation failed: {e}")
@@ -2743,9 +2938,12 @@ def main():
             strategies_data = {
                 'Nearest Neighbor': (segments_nn, metrics_nn),
                 'Elevation Greedy': (segments_elev, metrics_elev),
-                'Simulated Annealing (Scipy)': (segments_sa, metrics_sa),
-                'RL (PPO)': (segments_rl, metrics_rl)
+                'Simulated Annealing (Energy)': (segments_sa_energy, metrics_sa_energy),
+                'Simulated Annealing (Distance)': (segments_sa_dist, metrics_sa_dist)
             }
+
+            if RUN_RL_OPTIMIZER:
+                strategies_data['RL (PPO)'] = (segments_rl, metrics_rl)
             visualizer.plot_elevation_profiles(
                 strategies_data,
                 elevation_model,
@@ -2754,18 +2952,21 @@ def main():
         except Exception as e:
             print(f"     ✗ Elevation profiles failed: {e}")
 
-        # Individual algorithm animations
-        print("   - Creating animations for each algorithm...")
-        try:
-            visualizer.create_algorithm_comparison_animations(
-                waypoints,
-                strategies_data,
-                start_pos,
-                elevation_model=elevation_model,
-                planner=planner
-            )
-        except Exception as e:
-            print(f"     ✗ Algorithm animations failed: {e}")
+        # Individual algorithm animations (optional)
+        if SAVE_ALGORITHM_ANIMATIONS:
+            print("   - Creating animations for each algorithm...")
+            try:
+                visualizer.create_algorithm_comparison_animations(
+                    waypoints,
+                    strategies_data,
+                    start_pos,
+                    elevation_model=elevation_model,
+                    planner=planner
+                )
+            except Exception as e:
+                print(f"     ✗ Algorithm animations failed: {e}")
+        else:
+            print("   - Skipping algorithm animations (SAVE_ALGORITHM_ANIMATIONS = False)")
 
     # Energy consumption over path (for best strategy)
     print("   - Energy consumption analysis...")
