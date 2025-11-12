@@ -69,34 +69,6 @@ def interpolate_segment(seg: 'GridSegment', num_points: Optional[int] = None) ->
 
     return x_path, y_path, t
 
-@dataclass
-class BatteryState:
-    """Tracks battery state during path execution"""
-    capacity_wh: float  # Total battery capacity in Watt-hours
-    current_soc: float = 1.0  # State of charge (0-1)
-    energy_used_j: float = 0.0  # Energy consumed in Joules
-
-    def get_remaining_wh(self) -> float:
-        """Get remaining energy in Watt-hours"""
-        return self.capacity_wh * self.current_soc
-
-    def get_remaining_j(self) -> float:
-        """Get remaining energy in Joules"""
-        return self.capacity_wh * 3600 * self.current_soc
-
-    def consume_energy(self, energy_j: float) -> bool:
-        """
-        Consume energy from battery.
-        Returns True if successful, False if insufficient energy.
-        """
-        energy_wh = energy_j / 3600.0
-        if energy_wh > self.get_remaining_wh():
-            return False
-
-        self.energy_used_j += energy_j
-        self.current_soc -= energy_wh / self.capacity_wh
-        return True
-
 class ElevationModel:
     """Models vineyard terrain elevation"""
 
@@ -1243,7 +1215,6 @@ class GridConstrainedPlanner:
         Improvements:
         - Uses 3D distance for rolling resistance
         - Considers slope angle effect on rolling resistance
-        - Models regenerative braking efficiency on descents
         - Variable motor efficiency based on load
         - Includes terrain-specific coefficients
 
@@ -1294,23 +1265,13 @@ class GridConstrainedPlanner:
             total_energy = mechanical_energy / motor_efficiency
 
         else:
-            # DESCENDING: Can recover some energy through regenerative braking
+            # DESCENDING: Only rolling resistance energy consumed (no climbing energy)
             climbing_energy = 0.0
 
-            # Potential energy becomes available
-            descent_potential = abs(potential_energy)
+            # Total mechanical energy (rolling resistance only on descents)
+            mechanical_energy = rolling_energy + air_resistance_energy
 
-            # Regenerative braking efficiency (typical 30-50% for electric motors)
-            regen_efficiency = 0.40  # 40% energy recovery
-            recovered_energy = descent_potential * regen_efficiency
-
-            # Net energy = rolling resistance - recovered energy
-            mechanical_energy = rolling_energy + air_resistance_energy - recovered_energy
-
-            # Ensure non-negative (if descending steep slope, might generate net energy)
-            mechanical_energy = max(0, mechanical_energy)
-
-            # When in regenerative mode, efficiency is different
+            # Use standard motor efficiency
             motor_efficiency = self.mechanical_efficiency
             total_energy = mechanical_energy / motor_efficiency
 
@@ -1328,14 +1289,13 @@ class GridConstrainedPlanner:
             'motor_efficiency': motor_efficiency if elevation_change > 0 else self.mechanical_efficiency
         }
 
-    def calculate_metrics(self, segments: List[GridSegment], battery: Optional[BatteryState] = None) -> dict:
+    def calculate_metrics(self, segments: List[GridSegment]) -> dict:
         """
         Calculate path metrics including distance, time, and energy.
 
         Parameters:
         -----------
         segments: List of path segments
-        battery: Optional battery state to track energy consumption
 
         Returns:
         --------
@@ -1385,17 +1345,11 @@ class GridConstrainedPlanner:
             else:
                 total_elevation_loss += abs(energy_data['elevation_change'])
 
-            # Update battery if provided
-            if battery:
-                battery.consume_energy(energy_data['total_energy'])
-
         # Energy for turns (motors working during rotation)
         # Assume ~50W power during a turn
         turn_energy = num_turns * 50.0 * self.turn_time  # Watts * seconds = Joules
 
         total_energy += turn_energy
-        if battery:
-            battery.consume_energy(turn_energy)
 
         # Convert to more readable units
         energy_kj = total_energy / 1000.0  # Kilojoules
@@ -1419,12 +1373,6 @@ class GridConstrainedPlanner:
             'total_elevation_gain': total_elevation_gain,
             'total_elevation_loss': total_elevation_loss
         }
-
-        # Add battery metrics if tracking
-        if battery:
-            metrics['battery_soc'] = battery.current_soc
-            metrics['battery_remaining_wh'] = battery.get_remaining_wh()
-            metrics['battery_used_wh'] = battery.energy_used_j / 3600.0
 
         return metrics
 
@@ -1601,15 +1549,7 @@ class VineyardVisualizer:
         text += f"             ({metrics['total_energy_kwh']*1000:.2f} Wh)\n"
         text += f"Climbing: {metrics['climbing_energy_j']/1000:.2f} kJ\n"
         text += f"Rolling: {metrics['rolling_energy_j']/1000:.2f} kJ\n"
-        text += f"Air Drag: {metrics['air_resistance_energy_j']/1000:.2f} kJ\n"
         text += f"Turns: {metrics['turn_energy_j']/1000:.2f} kJ\n"
-
-        # Show battery state if available
-        if 'battery_soc' in metrics:
-            text += f"\nBattery State:\n"
-            text += f"━━━━━━━━━━━━━━━━━━━━━\n"
-            text += f"SOC: {metrics['battery_soc']*100:.1f}%\n"
-            text += f"Remaining: {metrics['battery_remaining_wh']:.1f} Wh\n"
 
         text += f"\nElevation:\n"
         text += f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2075,10 +2015,9 @@ class VineyardVisualizer:
         n_strategies = len(strategy_names)
 
         # 1. Energy Consumption Comparison (stacked bar)
-        energy_components = ['climbing_energy_j', 'rolling_energy_j',
-                           'air_resistance_energy_j', 'turn_energy_j']
-        component_labels = ['Climbing', 'Rolling', 'Air Drag', 'Turning']
-        colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#ffa07a']
+        energy_components = ['climbing_energy_j', 'rolling_energy_j', 'turn_energy_j']
+        component_labels = ['Climbing', 'Rolling', 'Turning']
+        colors = ['#ff6b6b', '#4ecdc4', '#ffa07a']
 
         x_pos = np.arange(n_strategies)
         bottom = np.zeros(n_strategies)
@@ -2135,7 +2074,6 @@ class VineyardVisualizer:
         pie_values = [
             best_metrics['climbing_energy_j'] / 1000,
             best_metrics['rolling_energy_j'] / 1000,
-            best_metrics['air_resistance_energy_j'] / 1000,
             best_metrics['turn_energy_j'] / 1000
         ]
 
@@ -2293,7 +2231,7 @@ class VineyardVisualizer:
                              planner: 'GridConstrainedPlanner',
                              save_as: Optional[str] = 'energy_over_path.png'):
         """
-        Plot cumulative energy consumption and battery state over the path.
+        Plot cumulative energy consumption and elevation profile over the path.
 
         Parameters:
         -----------
@@ -2303,33 +2241,42 @@ class VineyardVisualizer:
         """
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12))
 
-        # Calculate energy consumption along path
+        # Calculate energy consumption and elevation along path
         cumulative_distance = []
         cumulative_energy = []
         energy_rate = []
-        battery_soc = []
+        elevations = []
 
         dist = 0
         energy = 0
-        battery = BatteryState(capacity_wh=500)  # Example battery
 
+        # Add starting elevation
+        first_seg = segments[0] if segments else None
+        if first_seg and first_seg.elevation_start is not None:
+            elevations.append(first_seg.elevation_start)
+        else:
+            elevations.append(0)
         cumulative_distance.append(0)
         cumulative_energy.append(0)
-        battery_soc.append(1.0)
         energy_rate.append(0)
 
         for seg in segments:
             seg_dist = seg.distance()
-            seg_energy = planner.calculate_segment_energy(seg) if hasattr(planner, 'calculate_segment_energy') else 1000  # fallback
+            energy_data = planner.calculate_energy_for_segment(seg)
+            seg_energy = energy_data['total_energy']
 
             dist += seg_dist
             energy += seg_energy
-            battery.consume_energy(seg_energy)
 
             cumulative_distance.append(dist)
             cumulative_energy.append(energy / 1000)  # Convert to kJ
-            battery_soc.append(battery.current_soc)
             energy_rate.append(seg_energy / seg_dist if seg_dist > 0 else 0)  # J/m
+
+            # Track elevation at end of segment
+            if seg.elevation_end is not None:
+                elevations.append(seg.elevation_end)
+            else:
+                elevations.append(elevations[-1])  # Keep previous elevation
 
         # Plot 1: Cumulative Energy Consumption
         ax1.plot(cumulative_distance, cumulative_energy, 'b-', linewidth=2, label='Total Energy')
@@ -2359,28 +2306,33 @@ class VineyardVisualizer:
         ax2.grid(True, alpha=0.3)
         ax2.legend(loc='upper right', fontsize=10)
 
-        # Plot 3: Battery State of Charge
-        ax3.plot(cumulative_distance, [soc * 100 for soc in battery_soc], 'g-', linewidth=3, label='Battery SOC')
-        ax3.fill_between(cumulative_distance, [soc * 100 for soc in battery_soc], alpha=0.3, color='green')
+        # Plot 3: Elevation Profile
+        ax3.plot(cumulative_distance, elevations, 'brown', linewidth=2, label='Elevation')
+        ax3.fill_between(cumulative_distance, elevations, alpha=0.3, color='brown')
 
-        # Add warning zones
-        ax3.axhspan(0, 20, alpha=0.2, color='red', label='Critical (<20%)')
-        ax3.axhspan(20, 50, alpha=0.1, color='yellow', label='Low (20-50%)')
+        # Mark climbing and descending sections
+        for i in range(1, len(elevations)):
+            if elevations[i] > elevations[i-1]:
+                ax3.plot([cumulative_distance[i-1], cumulative_distance[i]],
+                        [elevations[i-1], elevations[i]],
+                        'r-', linewidth=3, alpha=0.6, label='Climbing' if i == 1 else '')
+            elif elevations[i] < elevations[i-1]:
+                ax3.plot([cumulative_distance[i-1], cumulative_distance[i]],
+                        [elevations[i-1], elevations[i]],
+                        'g-', linewidth=3, alpha=0.6, label='Descending' if i == 1 else '')
 
         ax3.set_xlabel('Distance (m)', fontsize=11)
-        ax3.set_ylabel('Battery SOC (%)', fontsize=11)
-        ax3.set_title('Battery State of Charge', fontsize=13, fontweight='bold')
-        ax3.set_ylim([0, 105])
+        ax3.set_ylabel('Elevation (m)', fontsize=11)
+        ax3.set_title('Elevation Profile Along Path', fontsize=13, fontweight='bold')
         ax3.grid(True, alpha=0.3)
-        ax3.legend(loc='lower left', fontsize=10)
+        ax3.legend(loc='upper right', fontsize=10)
 
-        # Add final SOC annotation
-        ax3.annotate(f'Final SOC: {battery_soc[-1]*100:.1f}%',
-                    xy=(cumulative_distance[-1], battery_soc[-1]*100),
-                    xytext=(-80, 15), textcoords='offset points',
-                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8),
-                    arrowprops=dict(arrowstyle='->', color='darkgreen', lw=2),
-                    fontsize=10, fontweight='bold')
+        # Add elevation change annotation
+        total_gain = sum(max(0, elevations[i] - elevations[i-1]) for i in range(1, len(elevations)))
+        total_loss = sum(max(0, elevations[i-1] - elevations[i]) for i in range(1, len(elevations)))
+        ax3.text(0.02, 0.98, f'Gain: {total_gain:.1f}m\nLoss: {total_loss:.1f}m',
+                transform=ax3.transAxes, fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
         plt.tight_layout()
 
@@ -2573,27 +2525,23 @@ def main():
         print("   3b. Elevation-based greedy sequencing...")
         segments_elev, metrics_elev = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='elevation')
 
-        print("   3c. Simulated Annealing (energy-optimized)...")
+        print("   3c. Simulated Annealing (scipy-based energy optimization)...")
         segments_sa, metrics_sa = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=1000)
 
-        print("   3d. Elevation clustering + SA...")
-        segments_cluster, metrics_cluster = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='clustering', num_clusters=3)
-
-        print("   3e. Multi-objective optimization (100% energy, 30% time)...")
-        segments_multi, metrics_multi = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='multi_objective', energy_weight=0.7, time_weight=0.3)
+        print("   3d. RL Optimizer (PPO algorithm)...")
+        segments_rl, metrics_rl = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='rl', objective='energy')
 
         # Compare sequencing strategies
         print("\n" + "="*70)
-        print("SEQUENCING STRATEGY COMPARISON")
+        print("SEQUENCING STRATEGY COMPARISON (4 STRATEGIES)")
         print("="*70)
 
         # Create comparison table
         strategies = {
-            'Nearest Neighbor (Baseline)': metrics_nn,
+            'Nearest Neighbor': metrics_nn,
             'Elevation Greedy': metrics_elev,
-            'Simulated Annealing': metrics_sa,
-            'Elevation Clustering': metrics_cluster,
-            'Multi-Objective (0.7/0.3)': metrics_multi
+            'Simulated Annealing (Scipy)': metrics_sa,
+            'RL (PPO)': metrics_rl
         }
 
         print("\n{:<30} {:>12} {:>12} {:>12}".format(
@@ -2639,16 +2587,13 @@ def main():
 
         # Use best energy strategy for visualization
         better_strategy = best_energy[0].lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
-        if 'simulated' in better_strategy:
+        if 'simulated' in better_strategy or 'scipy' in better_strategy:
             segments = segments_sa
             metrics = metrics_sa
-        elif 'clustering' in better_strategy:
-            segments = segments_cluster
-            metrics = metrics_cluster
-        elif 'multi' in better_strategy:
-            segments = segments_multi
-            metrics = metrics_multi
-        elif 'elevation' in better_strategy and 'clustering' not in better_strategy:
+        elif 'rl' in better_strategy or 'ppo' in better_strategy:
+            segments = segments_rl
+            metrics = metrics_rl
+        elif 'elevation' in better_strategy:
             segments = segments_elev
             metrics = metrics_elev
         else:
@@ -2680,7 +2625,6 @@ def main():
     print(f"Total Energy: {metrics['total_energy_kj']:.2f} kJ ({metrics['total_energy_kwh']*1000:.2f} Wh)")
     print(f"  - Climbing hills: {metrics['climbing_energy_j']/1000:.2f} kJ ({metrics['climbing_energy_j']/metrics['total_energy_j']*100:.1f}%)")
     print(f"  - Rolling resistance: {metrics['rolling_energy_j']/1000:.2f} kJ ({metrics['rolling_energy_j']/metrics['total_energy_j']*100:.1f}%)")
-    print(f"  - Air resistance: {metrics['air_resistance_energy_j']/1000:.2f} kJ ({metrics['air_resistance_energy_j']/metrics['total_energy_j']*100:.1f}%)")
     print(f"  - Turning maneuvers: {metrics['turn_energy_j']/1000:.2f} kJ ({metrics['turn_energy_j']/metrics['total_energy_j']*100:.1f}%)")
     print(f"Energy per distance: {metrics['total_energy_kj']/metrics['total_distance']*1000:.2f} J/m")
     print(f"Average power: {metrics['total_energy_j']/metrics['total_time']:.2f} W")
@@ -2799,7 +2743,8 @@ def main():
             strategies_data = {
                 'Nearest Neighbor': (segments_nn, metrics_nn),
                 'Elevation Greedy': (segments_elev, metrics_elev),
-                'Simulated Annealing': (segments_sa, metrics_sa)
+                'Simulated Annealing (Scipy)': (segments_sa, metrics_sa),
+                'RL (PPO)': (segments_rl, metrics_rl)
             }
             visualizer.plot_elevation_profiles(
                 strategies_data,
@@ -2846,12 +2791,13 @@ def main():
     if SAVE_3D_ANIMATION:
         print(f"  ✓ {OUTPUT_3D_ANIMATION} - 3D animation with trees")
     if COMPARE_STRATEGIES:
-        print(f"  ✓ strategy_comparison.png - Strategy performance comparison")
-        print(f"  ✓ elevation_profiles.png - Elevation profiles for strategies")
+        print(f"  ✓ strategy_comparison.png - Strategy performance comparison (4 strategies)")
+        print(f"  ✓ elevation_profiles.png - Elevation profiles for all strategies")
         print(f"  ✓ algorithm_nearest_neighbor.gif - Nearest Neighbor animation")
         print(f"  ✓ algorithm_elevation_greedy.gif - Elevation Greedy animation")
-        print(f"  ✓ algorithm_simulated_annealing.gif - Simulated Annealing animation")
-    print(f"  ✓ energy_over_path.png - Energy consumption and battery analysis")
+        print(f"  ✓ algorithm_simulated_annealing_scipy.gif - Simulated Annealing animation")
+        print(f"  ✓ algorithm_rl_ppo.gif - RL (PPO) animation")
+    print(f"  ✓ energy_over_path.png - Energy consumption and elevation analysis")
     print("="*70)
     print("\nDone! UGV returns to start position after visiting all waypoints.")
 
