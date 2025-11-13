@@ -90,9 +90,9 @@ class ElevationModel:
         self.resolution = resolution
         self.terrain_type = terrain_type
 
-        # Generate elevation grid
-        x = np.arange(grid_bounds[0], grid_bounds[1], resolution)
-        y = np.arange(grid_bounds[2], grid_bounds[3], resolution)
+        # Generate elevation grid (include endpoints to cover full extent)
+        x = np.arange(grid_bounds[0], grid_bounds[1] + resolution, resolution)
+        y = np.arange(grid_bounds[2], grid_bounds[3] + resolution, resolution)
         self.X, self.Y = np.meshgrid(x, y)
 
         # Generate realistic vineyard terrain
@@ -396,7 +396,7 @@ class EnergyAwareOptimizer:
                                 objective: str = 'energy',
                                 max_iterations: int = 1000,
                                 initial_temp: float = 100.0,
-                                cooling_rate: float = 0.995) -> List[Waypoint]:
+                                cooling_rate: float = 0.99) -> List[Waypoint]:
         """
         Use Simulated Annealing to find near-optimal waypoint sequence.
 
@@ -1915,11 +1915,15 @@ class VineyardVisualizer:
             ax.plot(x_path, y_path, z_path, color=color, linestyle=style,
                    linewidth=3, label=label, alpha=0.8, zorder=4)
 
-        # Set labels and title
-        ax.set_xlabel('Distance along row (m) - Upslope Direction', fontsize=10, labelpad=10)
-        ax.set_ylabel('Cross-row distance (m)', fontsize=10, labelpad=10)
-        ax.set_zlabel('Elevation (m ASL)', fontsize=10, labelpad=10)
+        # Set labels and title (X, Y are horizontal map coordinates)
+        ax.set_xlabel('X - Horizontal Distance (m)', fontsize=10, labelpad=10, fontweight='bold')
+        ax.set_ylabel('Y - Horizontal Distance (m)', fontsize=10, labelpad=10, fontweight='bold')
+        ax.set_zlabel('Elevation (m)', fontsize=10, labelpad=10, fontweight='bold')
         ax.set_title('Mosel Valley 3D Terrain with UGV Path', fontsize=14, fontweight='bold', pad=20)
+
+        # Add note about coordinate system
+        fig.text(0.5, 0.02, 'Note: X, Y axes show horizontal map distances. Actual 3D distance traveled along terrain is computed separately.',
+                ha='center', fontsize=8, style='italic', color='gray')
 
         # Set viewing angle - rotated 60 degrees from side view for better perspective
         ax.view_init(elev=30, azim=120)
@@ -2032,11 +2036,15 @@ class VineyardVisualizer:
                       markeredgewidth=2, zorder=10, label='UGV')
         trail, = ax.plot([], [], [], 'g-', linewidth=2, alpha=0.7, zorder=9)
 
-        # Set labels
-        ax.set_xlabel('X (m) - Upslope Direction', fontsize=10)
-        ax.set_ylabel('Y (m)', fontsize=10)
-        ax.set_zlabel('Elevation (m ASL)', fontsize=10)
+        # Set labels (X, Y are horizontal map coordinates, not slope distance)
+        ax.set_xlabel('X - Horizontal Distance (m)', fontsize=10, fontweight='bold')
+        ax.set_ylabel('Y - Horizontal Distance (m)', fontsize=10, fontweight='bold')
+        ax.set_zlabel('Elevation (m)', fontsize=10, fontweight='bold')
         ax.set_title('Mosel Valley 3D UGV Path Animation', fontsize=12, fontweight='bold')
+
+        # Add note about coordinate system
+        fig.text(0.5, 0.02, 'Note: X, Y show horizontal map distances. Actual traveled distance along terrain is 3D.',
+                ha='center', fontsize=8, style='italic', color='gray')
 
         # Set initial view (60 degree rotation for better perspective)
         ax.view_init(elev=25, azim=60)
@@ -2510,11 +2518,22 @@ class VineyardVisualizer:
             except Exception as e:
                 print(f"       ✗ Failed: {e}")
 
-def generate_random_waypoints(grid: VineyardGrid, num_waypoints: int = 10, elevation_model: Optional[ElevationModel] = None) -> List[Waypoint]:
+def generate_random_waypoints(grid: VineyardGrid, num_waypoints: int = 10, elevation_model: Optional[ElevationModel] = None, seed: Optional[int] = None) -> List[Waypoint]:
     """
     Generate random waypoints for testing with elevation.
     Waypoints are positioned in alleys (between rows) near tree positions.
+
+    Parameters:
+    -----------
+    grid: VineyardGrid instance
+    num_waypoints: Number of waypoints to generate
+    elevation_model: Optional elevation model for z-coordinates
+    seed: Random seed for reproducible waypoint generation (None for random)
     """
+    # Set random seed if provided for reproducibility
+    if seed is not None:
+        random.seed(seed)
+
     waypoints = []
 
     # We have num_rows-1 alleys (spaces between rows)
@@ -2549,9 +2568,20 @@ def generate_random_waypoints(grid: VineyardGrid, num_waypoints: int = 10, eleva
     return waypoints
 
 def run_statistical_analysis(grid, elevation_model, planner, num_trials=10, num_waypoints=15,
-                            run_rl=False, start_pos=(5.0, 1.5)):
+                            run_rl=False, start_pos=(5.0, 1.5), base_seed=42):
     """
     Run multiple trials and collect statistical performance data for each strategy.
+
+    Parameters:
+    -----------
+    grid: VineyardGrid instance
+    elevation_model: ElevationModel instance
+    planner: GridConstrainedPlanner instance
+    num_trials: Number of trials to run
+    num_waypoints: Number of waypoints per trial
+    run_rl: Include RL (PPO) strategy in comparison
+    start_pos: Starting position for tours
+    base_seed: Base random seed for reproducibility (trial i uses base_seed+i)
 
     Returns comprehensive statistics including mean, std, min, max, median, and percentiles.
     """
@@ -2562,6 +2592,8 @@ def run_statistical_analysis(grid, elevation_model, planner, num_trials=10, num_
     print("STATISTICAL ANALYSIS - MULTIPLE TRIALS")
     print("="*70)
     print(f"Running {num_trials} trials with {num_waypoints} waypoints each...")
+    seed_info = f"base_seed={base_seed} (trials use seed+0, seed+1, ...)" if base_seed is not None else "random seeds"
+    print(f"Reproducibility: {seed_info}")
     print()
 
     # Store results for each strategy
@@ -2586,7 +2618,8 @@ def run_statistical_analysis(grid, elevation_model, planner, num_trials=10, num_
 
         # Generate random waypoints for this trial
         waypoints = []
-        random.seed(trial * 42)  # Reproducible random waypoints
+        trial_seed = base_seed + trial if base_seed is not None else None
+        random.seed(trial_seed)  # Reproducible random waypoints
         for i in range(num_waypoints):
             row_id = random.randint(0, grid.num_rows - 2)
             x = random.uniform(5, grid.row_length - 5)
@@ -2771,6 +2804,7 @@ def main():
 
     # Waypoint Generation
     NUM_WAYPOINTS = 15         # Number of random waypoints to generate
+    WAYPOINTS_SEED = 351       # Seed for reproducible waypoint generation (None for random)
 
     # UGV Parameters (defined in GridConstrainedPlanner, listed here for reference)
     # UGV_MASS = 150.0         # kg (typical agricultural UGV)
@@ -2782,7 +2816,7 @@ def main():
     RUN_RL_OPTIMIZER = False  # Set to True to enable PPO training
 
     # Statistical Analysis
-    RUN_STATISTICAL_ANALYSIS = True  # Run multiple trials for statistical analysis
+    RUN_STATISTICAL_ANALYSIS = False  # Run multiple trials for statistical analysis
     NUM_TRIALS = 10           # Number of trials to run for statistical analysis
     NUM_WAYPOINTS_PER_TRIAL = 15  # Number of waypoints per trial
 
@@ -2836,8 +2870,9 @@ def main():
 
     # Generate random waypoints with elevation (in alleys between rows)
     print("2. Generating waypoints in alleys between rows...")
-    waypoints = generate_random_waypoints(grid, num_waypoints=NUM_WAYPOINTS, elevation_model=elevation_model)
-    print(f"   Generated {len(waypoints)} waypoints in alleys (between vine rows)")
+    waypoints = generate_random_waypoints(grid, num_waypoints=NUM_WAYPOINTS, elevation_model=elevation_model, seed=WAYPOINTS_SEED)
+    seed_status = f"seed={WAYPOINTS_SEED}" if WAYPOINTS_SEED is not None else "random seed"
+    print(f"   Generated {len(waypoints)} waypoints in alleys (between vine rows) [{seed_status}]")
 
     # Starting position (in an alley between rows)
     # With 20 rows and 3m spacing, alley 9 is between row 9 and 10 (middle of field)
@@ -2853,7 +2888,8 @@ def main():
             num_trials=NUM_TRIALS,
             num_waypoints=NUM_WAYPOINTS_PER_TRIAL,
             run_rl=RUN_RL_OPTIMIZER,
-            start_pos=start_pos
+            start_pos=start_pos,
+            base_seed=WAYPOINTS_SEED
         )
         print("\n✓ Statistical analysis completed!")
         print("\nNote: Skipping single-run comparison since statistical analysis was performed.")
