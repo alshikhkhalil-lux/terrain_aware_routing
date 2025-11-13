@@ -2548,6 +2548,208 @@ def generate_random_waypoints(grid: VineyardGrid, num_waypoints: int = 10, eleva
 
     return waypoints
 
+def run_statistical_analysis(grid, elevation_model, planner, num_trials=10, num_waypoints=15,
+                            run_rl=False, start_pos=(5.0, 1.5)):
+    """
+    Run multiple trials and collect statistical performance data for each strategy.
+
+    Returns comprehensive statistics including mean, std, min, max, median, and percentiles.
+    """
+    import statistics
+    from collections import defaultdict
+
+    print("\n" + "="*70)
+    print("STATISTICAL ANALYSIS - MULTIPLE TRIALS")
+    print("="*70)
+    print(f"Running {num_trials} trials with {num_waypoints} waypoints each...")
+    print()
+
+    # Store results for each strategy
+    results = defaultdict(lambda: {
+        'energy': [], 'time': [], 'distance': [],
+        'climbing_energy': [], 'rolling_energy': [], 'turn_energy': []
+    })
+
+    strategies_to_test = [
+        ('Nearest Neighbor', 'nearest_neighbor', {}),
+        ('Elevation Greedy', 'elevation', {}),
+        ('SA (Energy)', 'simulated_annealing', {'objective': 'energy', 'max_iterations': 2000}),
+        ('SA (Distance)', 'simulated_annealing', {'objective': 'distance', 'max_iterations': 2000}),
+    ]
+
+    if run_rl:
+        strategies_to_test.append(('RL (PPO)', 'rl', {'objective': 'energy', 'timesteps': 50000}))
+
+    for trial in range(num_trials):
+        print(f"\nTrial {trial + 1}/{num_trials}")
+        print("-" * 70)
+
+        # Generate random waypoints for this trial
+        waypoints = []
+        random.seed(trial * 42)  # Reproducible random waypoints
+        for i in range(num_waypoints):
+            row_id = random.randint(0, grid.num_rows - 2)
+            x = random.uniform(5, grid.row_length - 5)
+            alley_y = grid.get_alley_center_y(row_id)
+            offset_y = random.uniform(-0.3, 0.3)
+            y = alley_y + offset_y
+            z = elevation_model.get_elevation(x, y)
+            waypoints.append(Waypoint(x, y, z, row_id))
+
+        # Test each strategy
+        for strategy_name, mode, kwargs in strategies_to_test:
+            try:
+                print(f"   Testing {strategy_name}...", end=" ")
+                sys.stdout.flush()
+
+                segments, metrics, sequence = planner.plan_complete_tour(
+                    waypoints, start_pos, sequencing_mode=mode, **kwargs
+                )
+
+                # Store results
+                results[strategy_name]['energy'].append(metrics['total_energy_kj'])
+                results[strategy_name]['time'].append(metrics['total_time'] / 60.0)  # minutes
+                results[strategy_name]['distance'].append(metrics['total_distance_3d'])
+                results[strategy_name]['climbing_energy'].append(metrics['climbing_energy_j'] / 1000.0)
+                results[strategy_name]['rolling_energy'].append(metrics['rolling_energy_j'] / 1000.0)
+                results[strategy_name]['turn_energy'].append(metrics['turn_energy_j'] / 1000.0)
+
+                print(f"✓ (Energy: {metrics['total_energy_kj']:.2f} kJ)")
+
+                gc.collect()  # Clean up memory
+
+            except Exception as e:
+                print(f"✗ Failed: {e}")
+                # Use NaN for failed trials
+                for metric in ['energy', 'time', 'distance', 'climbing_energy', 'rolling_energy', 'turn_energy']:
+                    results[strategy_name][metric].append(float('nan'))
+
+    # Calculate statistics
+    print("\n" + "="*70)
+    print("STATISTICAL RESULTS")
+    print("="*70)
+
+    def calc_stats(data):
+        """Calculate statistics, filtering out NaN values"""
+        valid_data = [x for x in data if not np.isnan(x)]
+        if not valid_data:
+            return {
+                'mean': float('nan'), 'std': float('nan'), 'min': float('nan'),
+                'max': float('nan'), 'median': float('nan'),
+                'q25': float('nan'), 'q75': float('nan'),
+                'success_rate': 0.0
+            }
+        return {
+            'mean': statistics.mean(valid_data),
+            'std': statistics.stdev(valid_data) if len(valid_data) > 1 else 0.0,
+            'min': min(valid_data),
+            'max': max(valid_data),
+            'median': statistics.median(valid_data),
+            'q25': np.percentile(valid_data, 25),
+            'q75': np.percentile(valid_data, 75),
+            'success_rate': len(valid_data) / len(data) * 100.0
+        }
+
+    # Print Energy Statistics
+    print("\n1. ENERGY CONSUMPTION (kJ)")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Mean':>10} {'±Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
+    print("-" * 70)
+
+    for strategy_name in results.keys():
+        stats = calc_stats(results[strategy_name]['energy'])
+        print(f"{strategy_name:<25} {stats['mean']:>10.2f} {stats['std']:>10.2f} "
+              f"{stats['min']:>10.2f} {stats['max']:>10.2f} {stats['median']:>10.2f}")
+
+    # Print Time Statistics
+    print("\n2. TRAVEL TIME (minutes)")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Mean':>10} {'±Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
+    print("-" * 70)
+
+    for strategy_name in results.keys():
+        stats = calc_stats(results[strategy_name]['time'])
+        print(f"{strategy_name:<25} {stats['mean']:>10.2f} {stats['std']:>10.2f} "
+              f"{stats['min']:>10.2f} {stats['max']:>10.2f} {stats['median']:>10.2f}")
+
+    # Print Distance Statistics
+    print("\n3. TRAVEL DISTANCE (m)")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Mean':>10} {'±Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
+    print("-" * 70)
+
+    for strategy_name in results.keys():
+        stats = calc_stats(results[strategy_name]['distance'])
+        print(f"{strategy_name:<25} {stats['mean']:>10.2f} {stats['std']:>10.2f} "
+              f"{stats['min']:>10.2f} {stats['max']:>10.2f} {stats['median']:>10.2f}")
+
+    # Energy Component Breakdown
+    print("\n4. ENERGY COMPONENT BREAKDOWN (kJ) - Mean ± Std")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Climbing':>18} {'Rolling':>18} {'Turning':>18}")
+    print("-" * 70)
+
+    for strategy_name in results.keys():
+        climb_stats = calc_stats(results[strategy_name]['climbing_energy'])
+        roll_stats = calc_stats(results[strategy_name]['rolling_energy'])
+        turn_stats = calc_stats(results[strategy_name]['turn_energy'])
+        print(f"{strategy_name:<25} {climb_stats['mean']:>8.2f}±{climb_stats['std']:>7.2f} "
+              f"{roll_stats['mean']:>8.2f}±{roll_stats['std']:>7.2f} "
+              f"{turn_stats['mean']:>8.2f}±{turn_stats['std']:>7.2f}")
+
+    # Success Rate
+    print("\n5. SUCCESS RATE (%)")
+    print("-" * 70)
+    for strategy_name in results.keys():
+        stats = calc_stats(results[strategy_name]['energy'])
+        print(f"{strategy_name:<25} {stats['success_rate']:>10.1f}%")
+
+    # Statistical Comparison (Relative Performance)
+    print("\n6. RELATIVE PERFORMANCE (compared to Nearest Neighbor baseline)")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Energy':>15} {'Time':>15} {'Distance':>15}")
+    print("-" * 70)
+
+    nn_energy_mean = statistics.mean(results['Nearest Neighbor']['energy'])
+    nn_time_mean = statistics.mean(results['Nearest Neighbor']['time'])
+    nn_dist_mean = statistics.mean(results['Nearest Neighbor']['distance'])
+
+    for strategy_name in results.keys():
+        if strategy_name == 'Nearest Neighbor':
+            print(f"{strategy_name:<25} {'0.0% (baseline)':>15} {'0.0% (baseline)':>15} {'0.0% (baseline)':>15}")
+        else:
+            energy_mean = statistics.mean(results[strategy_name]['energy'])
+            time_mean = statistics.mean(results[strategy_name]['time'])
+            dist_mean = statistics.mean(results[strategy_name]['distance'])
+
+            energy_diff = ((energy_mean - nn_energy_mean) / nn_energy_mean) * 100
+            time_diff = ((time_mean - nn_time_mean) / nn_time_mean) * 100
+            dist_diff = ((dist_mean - nn_dist_mean) / nn_dist_mean) * 100
+
+            print(f"{strategy_name:<25} {energy_diff:>+14.2f}% {time_diff:>+14.2f}% {dist_diff:>+14.2f}%")
+
+    # Coefficient of Variation (stability metric)
+    print("\n7. COEFFICIENT OF VARIATION (lower = more stable)")
+    print("-" * 70)
+    print(f"{'Strategy':<25} {'Energy':>15} {'Time':>15} {'Distance':>15}")
+    print("-" * 70)
+
+    for strategy_name in results.keys():
+        energy_stats = calc_stats(results[strategy_name]['energy'])
+        time_stats = calc_stats(results[strategy_name]['time'])
+        dist_stats = calc_stats(results[strategy_name]['distance'])
+
+        cv_energy = (energy_stats['std'] / energy_stats['mean']) * 100 if energy_stats['mean'] > 0 else 0
+        cv_time = (time_stats['std'] / time_stats['mean']) * 100 if time_stats['mean'] > 0 else 0
+        cv_dist = (dist_stats['std'] / dist_stats['mean']) * 100 if dist_stats['mean'] > 0 else 0
+
+        print(f"{strategy_name:<25} {cv_energy:>14.2f}% {cv_time:>14.2f}% {cv_dist:>14.2f}%")
+
+    print("\n" + "="*70)
+
+    return results
+
+
 def main():
     """Main function to demonstrate the vineyard routing solution with elevation, energy, and animation"""
 
@@ -2562,7 +2764,7 @@ def main():
     TREE_SPACING = 1.5         # Distance between vine trees along row (meters)
 
     # Terrain Parameters
-    TERRAIN_TYPE = 'mosel'     # 'mosel' for hill-shaped or 'gentle' for gentle slopes
+    TERRAIN_TYPE = 'mosel'     # 'mosel' for hill-shaped or
     TERRAIN_RESOLUTION = 0.5   # Grid resolution for elevation sampling (meters)
     BASE_ELEVATION = 150.0     # Base elevation in meters (configured in ElevationModel)
     MAX_ELEVATION_GAIN = 30.0  # Maximum elevation gain along row (configured in ElevationModel)
@@ -2578,6 +2780,11 @@ def main():
  
     # TURN_TIME = 6.0          # seconds per 90° turn
     RUN_RL_OPTIMIZER = False  # Set to True to enable PPO training
+
+    # Statistical Analysis
+    RUN_STATISTICAL_ANALYSIS = True  # Run multiple trials for statistical analysis
+    NUM_TRIALS = 10           # Number of trials to run for statistical analysis
+    NUM_WAYPOINTS_PER_TRIAL = 15  # Number of waypoints per trial
 
     # Sequencing Strategy
     COMPARE_STRATEGIES = True  # Compare both sequencing strategies
@@ -2637,6 +2844,22 @@ def main():
     start_alley = 9
     start_pos = (0, grid.get_alley_center_y(start_alley))  # Start in middle alley
 
+    # Run statistical analysis if enabled
+    if RUN_STATISTICAL_ANALYSIS:
+        statistical_results = run_statistical_analysis(
+            grid=grid,
+            elevation_model=elevation_model,
+            planner=planner,
+            num_trials=NUM_TRIALS,
+            num_waypoints=NUM_WAYPOINTS_PER_TRIAL,
+            run_rl=RUN_RL_OPTIMIZER,
+            start_pos=start_pos
+        )
+        print("\n✓ Statistical analysis completed!")
+        print("\nNote: Skipping single-run comparison since statistical analysis was performed.")
+        print("="*70)
+        return  # Exit after statistical analysis
+
     # Plan tours with sequencing strategies
     print("3. Planning grid-constrained tours...")
 
@@ -2650,7 +2873,7 @@ def main():
         print("   3c. Simulated Annealing (energy optimization with 2000 iterations)...")
         sys.stdout.flush()
         # Using reduced iterations with periodic garbage collection to prevent segfault
-        segments_sa_energy, metrics_sa_energy, seq_sa_energy = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=2000)
+        segments_sa_energy, metrics_sa_energy, seq_sa_energy = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='energy', max_iterations=1500)
         print("      ✓ SA (energy) completed")
         gc.collect()  # Clean up after SA
         import time
@@ -2659,7 +2882,7 @@ def main():
 
         print("   3d. Simulated Annealing (distance optimization with 2000 iterations)...")
         sys.stdout.flush()
-        segments_sa_dist, metrics_sa_dist, seq_sa_dist = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='distance', max_iterations=2000)
+        segments_sa_dist, metrics_sa_dist, seq_sa_dist = planner.plan_complete_tour(waypoints, start_pos, sequencing_mode='simulated_annealing', objective='distance', max_iterations=1500)
         print("      ✓ SA (distance) completed")
         gc.collect()  # Clean up after SA
 
